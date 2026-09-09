@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <ctype.h>
 #include <errno.h>
+#include <termios.h>
 
 static int b_cd(int argc, char **argv) {
     const char *target;
@@ -337,26 +338,69 @@ static int b_return(int argc, char **argv) { exec_signal_return(argc > 1 ? atoi(
 
 static int b_read(int argc, char **argv) {
     const char *prompt = NULL;
+    bool silent = false;
     int i = 1;
-    if (i < argc && strcmp(argv[i], "-p") == 0 && i + 1 < argc) { prompt = argv[i+1]; i += 2; }
+    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+        if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) { prompt = argv[++i]; }
+        else if (strcmp(argv[i], "-s") == 0) { silent = true; }
+        else if (strcmp(argv[i], "-r") == 0) { /* raw mode is already the default: no backslash processing */ }
+        else break;
+    }
     if (prompt) { fputs(prompt, stdout); fflush(stdout); }
+
+    struct termios saved, raw;
+    bool restore_tty = false;
+    if (silent && isatty(STDIN_FILENO)) {
+        if (tcgetattr(STDIN_FILENO, &saved) == 0) {
+            raw = saved;
+            raw.c_lflag &= ~(tcflag_t)ECHO;
+            tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+            restore_tty = true;
+        }
+    }
     char line[4096];
-    if (!fgets(line, sizeof(line), stdin)) return 1;
+    bool ok = fgets(line, sizeof(line), stdin) != NULL;
+    if (restore_tty) { tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved); if (silent) putchar('\n'); }
+    if (!ok) return 1;
     size_t n = strlen(line);
     while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = '\0';
-    const char *varname = i < argc ? argv[i] : "REPLY";
-    var_set(varname, line, false);
+
+    int nvars = argc - i;
+    if (nvars <= 0) { var_set("REPLY", line, false); return 0; }
+
+    /* bash semantics: split on IFS whitespace across the given names, the
+     * last name absorbing whatever's left (including embedded whitespace). */
+    char *p = line;
+    for (int k = 0; k < nvars; k++) {
+        while (*p == ' ' || *p == '\t') p++;
+        char *start = p;
+        if (k == nvars - 1) {
+            char *end = p + strlen(p);
+            while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
+            char *val = xstrndup(start, (size_t)(end - start));
+            var_set(argv[i + k], val, false);
+            free(val);
+            break;
+        }
+        while (*p && *p != ' ' && *p != '\t') p++;
+        char *val = xstrndup(start, (size_t)(p - start));
+        var_set(argv[i + k], val, false);
+        free(val);
+    }
     return 0;
 }
 
-/* minimal `test` / `[` supporting common unary and binary operators */
-static int b_test(int argc, char **argv) {
+/* `test` / `[` supporting the common unary and binary operators, plus the
+ * file-comparison and file-type operators bash has beyond the POSIX set.
+ * Also reused (via test_eval) for the non-glob, non-regex operators inside
+ * `[[ ... ]]` atoms. */
+int test_eval(int argc, char **argv) {
     int n = argc - 1;
     char **a = argv + 1;
     if (n > 0 && strcmp(a[n-1], "]") == 0) n--;
     if (n == 0) return 1;
     if (n == 1) return a[0][0] == '\0' ? 1 : 0;
-    if (n == 2 && strcmp(a[0], "!") == 0) return !b_test(3, (char *[]){"test", a[1], NULL});
+    if (n == 2 && strcmp(a[0], "!") == 0) return !test_eval(3, (char *[]){"test", a[1], NULL});
     if (n == 2) {
         struct stat st;
         const char *op = a[0], *arg = a[1];
@@ -368,11 +412,29 @@ static int b_test(int argc, char **argv) {
         if (strcmp(op, "-x") == 0) return access(arg, X_OK) == 0 ? 0 : 1;
         if (strcmp(op, "-z") == 0) return arg[0] == '\0' ? 0 : 1;
         if (strcmp(op, "-n") == 0) return arg[0] != '\0' ? 0 : 1;
+        if (strcmp(op, "-s") == 0) return (stat(arg, &st) == 0 && st.st_size > 0) ? 0 : 1;
+        if (strcmp(op, "-L") == 0 || strcmp(op, "-h") == 0) {
+            struct stat lst;
+            return (lstat(arg, &lst) == 0 && S_ISLNK(lst.st_mode)) ? 0 : 1;
+        }
+        if (strcmp(op, "-b") == 0) return (stat(arg, &st) == 0 && S_ISBLK(st.st_mode)) ? 0 : 1;
+        if (strcmp(op, "-c") == 0) return (stat(arg, &st) == 0 && S_ISCHR(st.st_mode)) ? 0 : 1;
+        if (strcmp(op, "-p") == 0) return (stat(arg, &st) == 0 && S_ISFIFO(st.st_mode)) ? 0 : 1;
+        if (strcmp(op, "-S") == 0) return (stat(arg, &st) == 0 && S_ISSOCK(st.st_mode)) ? 0 : 1;
     }
     if (n == 3) {
         const char *l = a[0], *op = a[1], *r = a[2];
         if (strcmp(op, "=") == 0 || strcmp(op, "==") == 0) return strcmp(l, r) == 0 ? 0 : 1;
         if (strcmp(op, "!=") == 0) return strcmp(l, r) != 0 ? 0 : 1;
+        if (strcmp(op, "<") == 0) return strcmp(l, r) < 0 ? 0 : 1;
+        if (strcmp(op, ">") == 0) return strcmp(l, r) > 0 ? 0 : 1;
+        if (strcmp(op, "-nt") == 0 || strcmp(op, "-ot") == 0 || strcmp(op, "-ef") == 0) {
+            struct stat sl, sr;
+            bool lok = stat(l, &sl) == 0, rok = stat(r, &sr) == 0;
+            if (strcmp(op, "-nt") == 0) return (lok && (!rok || sl.st_mtime > sr.st_mtime)) ? 0 : 1;
+            if (strcmp(op, "-ot") == 0) return (rok && (!lok || sl.st_mtime < sr.st_mtime)) ? 0 : 1;
+            return (lok && rok && sl.st_dev == sr.st_dev && sl.st_ino == sr.st_ino) ? 0 : 1;
+        }
         long li = strtol(l, NULL, 10), ri = strtol(r, NULL, 10);
         if (strcmp(op, "-eq") == 0) return li == ri ? 0 : 1;
         if (strcmp(op, "-ne") == 0) return li != ri ? 0 : 1;
@@ -382,6 +444,28 @@ static int b_test(int argc, char **argv) {
         if (strcmp(op, "-ge") == 0) return li >= ri ? 0 : 1;
     }
     return 1;
+}
+
+/* `local [NAME[=value] ...]`: declares NAME as scoped to the enclosing
+ * function call, saving whatever it was (or that it was unset) so it's
+ * restored the moment that call returns. Only valid inside a function. */
+static int b_local(int argc, char **argv) {
+    if (!var_in_function_scope()) {
+        fprintf(stderr, "spire: local: can only be used inside a function\n");
+        return 1;
+    }
+    for (int i = 1; i < argc; i++) {
+        char *eq = strchr(argv[i], '=');
+        if (eq) {
+            *eq = '\0';
+            var_declare_local(argv[i]);
+            var_set(argv[i], eq + 1, var_is_exported(argv[i]));
+            *eq = '=';
+        } else {
+            var_declare_local(argv[i]);
+        }
+    }
+    return 0;
 }
 
 static int b_module(int argc, char **argv) {
@@ -405,7 +489,8 @@ static int b_module(int argc, char **argv) {
 static int b_colorscheme(int argc, char **argv) {
     if (argc < 2) {
         printf("current color scheme (see ~/.config/spire/spire.conf to customize):\n");
-        const char *classes[] = {"command","command_invalid","builtin","string","variable","operator","comment","keyword","number","path","array", NULL};
+        const char *classes[] = {"command","command_invalid","builtin","string","variable","operator",
+                                  "comment","keyword","number","path","array","flag", NULL};
         for (int i = 0; classes[i]; i++) printf("  %-16s %s\n", classes[i], config_color(classes[i]));
         return 0;
     }
@@ -414,30 +499,46 @@ static int b_colorscheme(int argc, char **argv) {
         config_set("color.variable", "cyan"); config_set("color.operator", "magenta");
         config_set("color.keyword", "blue"); config_set("color.comment", "brightblack");
         config_set("color.path", "white"); config_set("color.array", "brightmagenta");
+        config_set("color.flag", "brightcyan"); config_set("color.number", "magenta");
     } else if (strcmp(argv[1], "light") == 0) {
         config_set("color.command", "blue"); config_set("color.string", "green");
         config_set("color.variable", "magenta"); config_set("color.operator", "red");
         config_set("color.keyword", "cyan"); config_set("color.comment", "black");
         config_set("color.path", "black"); config_set("color.array", "magenta");
+        config_set("color.flag", "blue"); config_set("color.number", "red");
     } else if (strcmp(argv[1], "mono") == 0) {
         config_set("color.command", "white"); config_set("color.string", "white");
         config_set("color.variable", "white"); config_set("color.operator", "white");
         config_set("color.keyword", "white"); config_set("color.comment", "brightblack");
         config_set("color.path", "white"); config_set("color.array", "white");
+        config_set("color.flag", "brightblack"); config_set("color.number", "white");
     } else if (strcmp(argv[1], "solarized") == 0) {
         config_set("color.command", "green"); config_set("color.string", "83");
         config_set("color.variable", "37"); config_set("color.operator", "yellow");
         config_set("color.keyword", "blue"); config_set("color.comment", "brightblack");
         config_set("color.path", "37"); config_set("color.array", "magenta");
-        config_set("color.number", "166");
+        config_set("color.number", "166"); config_set("color.flag", "37");
     } else if (strcmp(argv[1], "nord") == 0) {
         config_set("color.command", "109"); config_set("color.string", "150");
         config_set("color.variable", "111"); config_set("color.operator", "145");
         config_set("color.keyword", "111"); config_set("color.comment", "brightblack");
         config_set("color.path", "145"); config_set("color.array", "175");
-        config_set("color.number", "175");
+        config_set("color.number", "175"); config_set("color.flag", "110");
+    } else if (strcmp(argv[1], "gruvbox") == 0) {
+        config_set("color.command", "142"); config_set("color.string", "214");
+        config_set("color.variable", "109"); config_set("color.operator", "167");
+        config_set("color.keyword", "175"); config_set("color.comment", "245");
+        config_set("color.path", "223"); config_set("color.array", "208");
+        config_set("color.number", "208"); config_set("color.flag", "108");
+    } else if (strcmp(argv[1], "dracula") == 0) {
+        config_set("color.command", "84"); config_set("color.string", "228");
+        config_set("color.variable", "141"); config_set("color.operator", "212");
+        config_set("color.keyword", "141"); config_set("color.comment", "61");
+        config_set("color.path", "253"); config_set("color.array", "212");
+        config_set("color.number", "215"); config_set("color.flag", "117");
     } else {
-        fprintf(stderr, "spire: colorscheme: unknown scheme '%s' (try dark, light, mono, solarized, nord)\n", argv[1]);
+        fprintf(stderr, "spire: colorscheme: unknown scheme '%s' "
+                         "(try dark, light, mono, solarized, nord, gruvbox, dracula)\n", argv[1]);
         return 1;
     }
     return 0;
@@ -450,11 +551,15 @@ static int b_help(int argc, char **argv) {
         "control flow (fish or bash syntax both work):\n"
         "  if / else if / else / end        if / elif / else / fi\n"
         "  while ... end                    while ... do ... done\n"
+        "  until ... end                    until ... do ... done\n"
         "  for X in ...; ... end            for X in ...; do ... done\n"
-        "  function name ... end            name() { ... }\n\n"
+        "  function name ... end            name() { ... }\n"
+        "  [[ -f x && -r x ]]               extended test: == != =~ && || !\n\n"
+        "  {a,b,c}  {1..5}  {01..10..2}     brace expansion\n\n"
         "builtins: cd pwd exit export unset alias unalias source echo printf\n"
         "          type jobs fg bg wait history set functions true false\n"
-        "          break continue return read test module colorscheme help\n\n"
+        "          break continue return read test local let set_color\n"
+        "          module colorscheme help\n\n"
         "run `module list` to see enabled modules, and edit\n"
         "~/.config/spire/spire.conf to customize colors and the prompt.\n");
     return 0;
@@ -471,8 +576,8 @@ static BuiltinEntry g_table[] = {
     {"type", b_type}, {"which", b_type}, {"jobs", b_jobs}, {"fg", b_fg}, {"bg", b_bg},
     {"wait", b_wait}, {"history", b_history}, {"set", b_set}, {"functions", b_functions},
     {"true", b_true}, {"false", b_false}, {"break", b_break}, {"continue", b_continue},
-    {"return", b_return}, {"read", b_read}, {"test", b_test}, {"[", b_test},
-    {"let", b_let}, {"set_color", b_set_color},
+    {"return", b_return}, {"read", b_read}, {"test", test_eval}, {"[", test_eval},
+    {"let", b_let}, {"set_color", b_set_color}, {"local", b_local},
     {"module", b_module}, {"colorscheme", b_colorscheme}, {"help", b_help},
     {NULL, NULL}
 };

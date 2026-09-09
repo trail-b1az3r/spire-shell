@@ -93,3 +93,53 @@ void vars_dump(strvec_t *names_out) {
         for (VarEntry *e = buckets[i]; e; e = e->next)
             sv_push_dup(names_out, e->name);
 }
+
+/* ---------------- local variable scoping ---------------- */
+
+typedef struct {
+    strvec_t names;
+    strvec_t vals;      /* saved old value, or "" when had==0 */
+    strvec_t had;        /* "1"/"0": did the name exist before this frame declared it */
+    strvec_t exported;   /* "1"/"0": was it exported before */
+} LocalFrame;
+
+static LocalFrame *g_frames = NULL;
+static int g_frame_count = 0;
+static int g_frame_cap = 0;
+
+void var_push_scope(void) {
+    if (g_frame_count + 1 > g_frame_cap) {
+        g_frame_cap = g_frame_cap ? g_frame_cap * 2 : 8;
+        g_frames = xrealloc(g_frames, sizeof(LocalFrame) * (size_t)g_frame_cap);
+    }
+    LocalFrame *f = &g_frames[g_frame_count++];
+    sv_init(&f->names); sv_init(&f->vals); sv_init(&f->had); sv_init(&f->exported);
+}
+
+void var_pop_scope(void) {
+    if (g_frame_count == 0) return;
+    LocalFrame *f = &g_frames[--g_frame_count];
+    for (size_t i = f->names.count; i > 0; i--) {
+        size_t idx = i - 1;
+        if (strcmp(f->had.items[idx], "1") == 0)
+            var_set(f->names.items[idx], f->vals.items[idx], strcmp(f->exported.items[idx], "1") == 0);
+        else
+            var_unset(f->names.items[idx]);
+    }
+    sv_free(&f->names); sv_free(&f->vals); sv_free(&f->had); sv_free(&f->exported);
+}
+
+bool var_declare_local(const char *name) {
+    if (g_frame_count == 0) return false;
+    LocalFrame *f = &g_frames[g_frame_count - 1];
+    for (size_t i = 0; i < f->names.count; i++)
+        if (strcmp(f->names.items[i], name) == 0) return true; /* already declared this frame */
+    const char *old = var_get(name);
+    sv_push_dup(&f->names, name);
+    sv_push_dup(&f->vals, old ? old : "");
+    sv_push_dup(&f->had, old ? "1" : "0");
+    sv_push_dup(&f->exported, var_is_exported(name) ? "1" : "0");
+    return true;
+}
+
+bool var_in_function_scope(void) { return g_frame_count > 0; }

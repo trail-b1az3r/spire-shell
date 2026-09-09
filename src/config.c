@@ -71,6 +71,7 @@ void config_init(void) {
     config_set("color.number", "magenta");
     config_set("color.path", "white");
     config_set("color.array", "brightmagenta");
+    config_set("color.flag", "brightcyan");
     config_set("color.suggestion", "brightblack");
     config_set("color.text", "default");
     config_set("history.size", "5000");
@@ -157,6 +158,7 @@ void config_load_default(void) {
                 "color.number = magenta\n"
                 "color.path = white\n"
                 "color.array = brightmagenta\n"
+                "color.flag = brightcyan\n"
                 "color.suggestion = brightblack\n"
                 "history.size = 5000\n"
                 "modules = \n");

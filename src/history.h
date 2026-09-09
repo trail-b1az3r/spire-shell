@@ -16,4 +16,10 @@ void history_print(void);
  * inline autosuggestions. */
 const char *history_find_prefix_match(const char *prefix);
 
+/* For Ctrl-R reverse incremental search: the "back" distance (as used by
+ * history_get_relative) of the most recent entry containing `needle` as a
+ * substring, searched starting strictly further back than `search_from_back`
+ * (0 to start from the very latest entry). Returns 0 if none found. */
+int history_find_substring(const char *needle, int search_from_back);
+
 #endif

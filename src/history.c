@@ -79,3 +79,12 @@ const char *history_find_prefix_match(const char *prefix) {
     }
     return NULL;
 }
+
+int history_find_substring(const char *needle, int search_from_back) {
+    if (!needle || !*needle) return 0;
+    for (int back = search_from_back + 1; (size_t)back <= g_count; back++) {
+        const char *e = g_entries[g_count - (size_t)back];
+        if (strstr(e, needle)) return back;
+    }
+    return 0;
+}

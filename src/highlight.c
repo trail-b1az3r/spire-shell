@@ -9,13 +9,33 @@
 #include <unistd.h>
 
 static const char *g_keywords[] = {
-    "if", "then", "else", "elif", "fi", "end", "for", "while", "do", "done",
-    "function", "in", "begin", "case", "esac", "switch", NULL
+    "if", "then", "else", "elif", "fi", "end", "for", "while", "until", "do", "done",
+    "function", "in", "begin", "case", "esac", "switch", "[[", "]]", "!", NULL
 };
 
 static bool is_keyword(const char *w) {
     for (int i = 0; g_keywords[i]; i++) if (strcmp(g_keywords[i], w) == 0) return true;
     return false;
+}
+
+/* words that read as flags/operators wherever they appear -- `[[ ]]`/`test`
+ * operators and bare `-x`-style option flags -- get their own color instead
+ * of whatever color the surrounding position would otherwise imply. */
+static const char *g_test_ops[] = {
+    "==", "!=", "=~", "-eq", "-ne", "-lt", "-le", "-gt", "-ge",
+    "-f", "-d", "-e", "-r", "-w", "-x", "-z", "-n", "-s", "-L", "-h",
+    "-b", "-c", "-p", "-S", "-nt", "-ot", "-ef", NULL
+};
+
+static bool is_test_op(const char *w) {
+    for (int i = 0; g_test_ops[i]; i++) if (strcmp(g_test_ops[i], w) == 0) return true;
+    return false;
+}
+
+/* only called on plain barewords (no quotes/$/\), so a leading '-' reliably
+ * means an option flag, not e.g. the start of a quoted string. */
+static bool is_option_flag(const char *w, size_t len) {
+    return len >= 2 && w[0] == '-';
 }
 
 bool command_exists(const char *name) {
@@ -174,7 +194,10 @@ char *highlight_line(const char *buf) {
 
                 if (at_cmd_pos && plain_bareword && is_keyword(word)) {
                     color_wrap_n(&out, config_color("keyword"), seg, seglen);
-                    /* stays at command position: the next word is still a command/condition */
+                    /* "[[" is followed by a test expression, not a command;
+                     * every other keyword stays at command position since
+                     * its next word still starts a command/condition. */
+                    if (strcmp(word, "[[") == 0) at_cmd_pos = false;
                 } else if (at_cmd_pos) {
                     const char *cls;
                     if (plain_bareword && builtin_exists(word)) cls = "builtin";
@@ -184,6 +207,10 @@ char *highlight_line(const char *buf) {
                     if (plain_bareword) color_wrap_n(&out, config_color(cls), seg, seglen);
                     else emit_word(&out, seg, seglen, "text");
                     at_cmd_pos = false;
+                } else if (plain_bareword && is_test_op(word)) {
+                    color_wrap_n(&out, config_color("flag"), seg, seglen);
+                } else if (plain_bareword && is_option_flag(word, seglen)) {
+                    color_wrap_n(&out, config_color("flag"), seg, seglen);
                 } else {
                     bool looks_path = seglen > 0 && (seg[0] == '/' ||
                         (seglen > 1 && seg[0] == '.' && seg[1] == '/') ||

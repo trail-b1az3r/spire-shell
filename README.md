@@ -20,14 +20,28 @@ toy. It is, however, a big project built in one sitting, so see
 
 - **Both syntaxes, one parser.** Write `if`/`else if`/`end` or
   `if`/`then`/`elif`/`fi`. Write `for x in a b; do ... done` or
-  `for x in a b; ... end`. Define functions with `function name ... end`
-  or `name() { ... }`. Mix and match freely, even in the same file.
+  `for x in a b; ... end`. `while`/`until`, either style
+  (`until cond; do ... done` or `until cond ... end`). Define functions
+  with `function name ... end` or `name() { ... }`. Mix and match freely,
+  even in the same file. A leading `!` negates any pipeline's exit status.
+- **`[[ ... ]]` extended tests**: `==`/`!=` do glob matching, `=~` matches
+  a POSIX extended regex, `&&`/`||`/`!` combine and negate atoms, plus
+  every `test` operator (`-f -d -e -r -w -x -z -n -s -L -nt -ot -ef ...`).
+  Parenthesized sub-grouping isn't supported — see
+  [Limitations](#limitations).
+- **Brace expansion**: `{a,b,c}`, `{1..10}`, `{10..1..2}`, `{a..e}`, with
+  zero-padding preserved (`{01..10}`) and nesting (`{a,b}{1,2}`).
+  Respects quoting, like real brace expansion should.
 - **Math**: `$((expr))` and standalone `(( expr ))` support the full
   C-style operator set — `+ - * / % ** << >> < <= > >= == != & | ^ && ||
   ?: = += -= *= /= %= ++ --` — plus a `let` builtin.
 - **Arrays**: bash-style `arr=(a b c)`, `arr+=(d)`, `arr[2]=x`,
   `${arr[i]}` (negative indices count from the end), `${arr[@]}`,
   `${arr[*]}`, `${#arr[@]}`, and fish-style `set arr a b c`.
+- **`local` variables**: dynamically scoped exactly like bash — `local
+  name[=value]` inside a function saves whatever the name held (or that
+  it was unset) and restores it the moment that call returns, so
+  recursive functions don't stomp on each other's variables.
 - **case/esac and switch/case/end**, both wired to the same matcher
   (glob-style patterns via `fnmatch`, `|` to combine patterns in the
   bash form).
@@ -41,14 +55,23 @@ toy. It is, however, a big project built in one sitting, so see
 - **Live syntax highlighting**, computed and redrawn on every keystroke,
   with colors defined in a config file, not hardcoded — commands,
   invalid commands, strings, variables, operators, comments, keywords,
-  numbers, filesystem paths, and array subscripts each get their own
-  configurable color, plus a `set_color` builtin (à la fish) for
-  building custom-colored prompts and output, and five built-in
-  `colorscheme` presets (`dark`, `light`, `mono`, `solarized`, `nord`).
+  numbers, filesystem paths, option flags/test operators, and array
+  subscripts each get their own configurable color, plus a `set_color`
+  builtin (à la fish) for building custom-colored prompts and output,
+  and seven built-in `colorscheme` presets (`dark`, `light`, `mono`,
+  `solarized`, `nord`, `gruvbox`, `dracula`).
 - **A real line editor**, built on raw termios, not GNU readline: arrow
-  keys, Ctrl-A/E/U/K/W, history browsing, Tab completion for commands,
-  files, and `$variables`, Ctrl-C to cancel a line without killing the
-  shell, Ctrl-L to clear the screen.
+  keys, Ctrl-A/E/U/K/W/T (transpose), Alt-F/B (word motion), Alt-D/
+  Alt-Backspace (word delete), Ctrl-R reverse incremental history search,
+  history browsing, Ctrl-C to cancel a line without killing the shell,
+  Ctrl-L to clear the screen.
+- **Context-aware Tab completion** for commands, files, and
+  `$variables`: directory-only completion after `cd`/`pushd`/`rmdir`,
+  `~/...` completion against your real home directory without spelling
+  it out in the edited line, repeated Tab cycles through a colorized
+  candidate menu (like zsh's menu-complete) instead of just listing them,
+  and a fuzzy (subsequence) fallback when nothing matches the literal
+  prefix — `cfgfile<Tab>` still finds `my_config_file.txt`.
 - **Pipes, redirection, job control**: `|`, `&&`, `||`, `;`, `&`,
   `>`, `>>`, `<`, `2>`, `2>>`, `2>&1`, `&>`, plus `jobs`/`fg`/`bg`/`wait`.
   Foreground jobs get real terminal control via `tcsetpgrp`.
@@ -63,9 +86,10 @@ toy. It is, however, a big project built in one sitting, so see
 - **A module system**: drop a `.spire` file in `~/.config/spire/modules/`,
   list it in `modules = ...` in the config, and it's sourced at startup.
   Two starter modules ship in the box (`aliases`, `git`).
-- **~28 builtins**: `cd pwd exit export unset alias unalias source echo
+- **~30 builtins**: `cd pwd exit export unset alias unalias source echo
   printf type which jobs fg bg wait history set functions true false
-  break continue return read test let set_color module colorscheme help`.
+  break continue return read test local let set_color module colorscheme
+  help`.
 
 ## Building & installing
 
@@ -170,6 +194,7 @@ color.operator        = magenta
 color.comment         = brightblack
 color.keyword         = blue
 color.number          = magenta
+color.flag            = brightcyan
 
 history.size = 5000
 modules = aliases, git
@@ -182,8 +207,9 @@ Prompt escapes: `%n` user, `%m` host, `%~` cwd (with `$HOME` shortened to
 Color values: `black red green yellow blue magenta cyan white default`,
 their `bright*` variants, `bold-<name>`, or a raw 256-color number.
 
-There's also a `colorscheme` builtin with a couple of built-in presets
-(`colorscheme dark|light|mono`) if you'd rather not hand-pick every color.
+There's also a `colorscheme` builtin with seven built-in presets
+(`colorscheme dark|light|mono|solarized|nord|gruvbox|dracula`) if you'd
+rather not hand-pick every color.
 
 ## Writing a module
 
@@ -238,6 +264,10 @@ suite. Known gaps, so nothing surprises you:
 - No process substitution (`<(cmd)` / `>(cmd)`).
 - No true nested arrays or associative arrays (maps) — only flat,
   integer-indexed arrays.
+- `[[ ... ]]` doesn't support parenthesized sub-grouping (`( expr )`
+  inside the brackets) or unquoted `<`/`>` string-ordering operators —
+  use `&&`/`||` to combine tests instead, and quote comparisons.
+- No `select` loops or `trap`.
 - UTF-8 in the line editor is passed through but cursor-column math
   assumes one byte = one column, so multi-byte characters can throw off
   cursor positioning during editing (the content itself is fine).
