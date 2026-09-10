@@ -18,6 +18,7 @@
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <fnmatch.h>
+#include <regex.h>
 
 int g_exec_depth = 0;
 volatile bool g_should_exit = false;
@@ -527,6 +528,55 @@ static int exec_while(Node *n) {
     return status;
 }
 
+static int exec_until(Node *n) {
+    int status = 0;
+    for (;;) {
+        int cond = exec_stmt(n->children[0]);
+        if (g_should_exit || g_return_flag) return cond;
+        if (cond == 0) break; /* condition became true -> stop looping */
+        status = exec_block(n->children[1]);
+        if (g_should_exit || g_return_flag) return status;
+        if (g_break_flag) { g_break_flag = false; break; }
+        if (g_continue_flag) { g_continue_flag = false; continue; }
+    }
+    return status;
+}
+
+/* ---------- [[ ... ]] extended test ---------- */
+
+static int exec_cond_atom(Node *n) {
+    strvec_t words; sv_init(&words);
+    for (size_t i = 0; i < n->argv.count; i++)
+        sv_push(&words, expand_pattern_single(n->argv.items[i]));
+
+    int result;
+    if (words.count == 3 && (strcmp(words.items[1], "==") == 0 || strcmp(words.items[1], "=") == 0)) {
+        result = fnmatch(words.items[2], words.items[0], 0) == 0 ? 0 : 1;
+    } else if (words.count == 3 && strcmp(words.items[1], "!=") == 0) {
+        result = fnmatch(words.items[2], words.items[0], 0) != 0 ? 0 : 1;
+    } else if (words.count == 3 && strcmp(words.items[1], "=~") == 0) {
+        regex_t re;
+        if (regcomp(&re, words.items[2], REG_EXTENDED) != 0) {
+            result = 1;
+        } else {
+            result = regexec(&re, words.items[0], 0, NULL, 0) == 0 ? 0 : 1;
+            regfree(&re);
+        }
+    } else if (words.count == 0) {
+        result = 1;
+    } else {
+        char **cargv = xmalloc(sizeof(char *) * (words.count + 2));
+        cargv[0] = (char *)"test";
+        for (size_t i = 0; i < words.count; i++) cargv[i + 1] = words.items[i];
+        cargv[words.count + 1] = NULL;
+        result = test_eval((int)words.count + 1, cargv);
+        free(cargv);
+    }
+    sv_free(&words);
+    if (n->negate) result = (result == 0) ? 1 : 0;
+    return result;
+}
+
 static int exec_for(Node *n) {
     strvec_t items; sv_init(&items);
     for (size_t i = 0; i < n->for_words.count; i++) expand_word(n->for_words.items[i], &items);
@@ -546,6 +596,7 @@ static int exec_for(Node *n) {
 int exec_call_function(Node *body, int argc, char **argv) {
     if (g_exec_depth > 200) { fprintf(stderr, "spire: function call depth exceeded\n"); return 1; }
     g_exec_depth++;
+    var_push_scope();
 
     /* save positional params to restore after the call (poor man's scoping) */
     strvec_t save_names, save_vals; sv_init(&save_names); sv_init(&save_vals);
@@ -582,6 +633,7 @@ int exec_call_function(Node *body, int argc, char **argv) {
     sv_free(&save_names);
     sv_free(&save_vals);
 
+    var_pop_scope();
     g_exec_depth--;
     return status;
 }
@@ -630,31 +682,34 @@ static int exec_subshell(Node *n) {
 static int exec_stmt(Node *n) {
     if (!n) return 0;
     if (n->background && (n->type == N_CMD || n->type == N_PIPELINE || n->type == N_AND ||
-                           n->type == N_OR || n->type == N_SUBSHELL || n->type == N_CASE)) {
+                           n->type == N_OR || n->type == N_SUBSHELL || n->type == N_CASE ||
+                           n->type == N_CONDATOM)) {
         return exec_background(n);
     }
     switch (n->type) {
-        case N_CMD: return exec_simple_command(n);
-        case N_PIPELINE: return exec_pipeline(n);
+        case N_CMD: { int s = exec_simple_command(n); return n->negate ? (s == 0) : s; }
+        case N_PIPELINE: { int s = exec_pipeline(n); return n->negate ? (s == 0) : s; }
         case N_AND: {
             int l = exec_stmt(n->children[0]);
             if (g_should_exit || g_break_flag || g_continue_flag || g_return_flag) return l;
-            if (l != 0) return l;
-            return exec_stmt(n->children[1]);
+            int s = (l != 0) ? l : exec_stmt(n->children[1]);
+            return n->negate ? (s == 0) : s;
         }
         case N_OR: {
             int l = exec_stmt(n->children[0]);
             if (g_should_exit || g_break_flag || g_continue_flag || g_return_flag) return l;
-            if (l == 0) return l;
-            return exec_stmt(n->children[1]);
+            int s = (l == 0) ? l : exec_stmt(n->children[1]);
+            return n->negate ? (s == 0) : s;
         }
         case N_SEQ: return exec_block(n);
         case N_BLOCK: return exec_block(n);
         case N_IF: return exec_if(n);
         case N_WHILE: return exec_while(n);
+        case N_UNTIL: return exec_until(n);
         case N_FOR: return exec_for(n);
         case N_CASE: return exec_case(n);
-        case N_SUBSHELL: return exec_subshell(n);
+        case N_SUBSHELL: { int s = exec_subshell(n); return n->negate ? (s == 0) : s; }
+        case N_CONDATOM: return exec_cond_atom(n);
         case N_FUNCDEF: {
             Node *body = n->children[0];
             n->children[0] = NULL; /* transfer ownership to the function table */

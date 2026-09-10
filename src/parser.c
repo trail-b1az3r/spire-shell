@@ -20,11 +20,13 @@ static Node *parse_command(Parser *p);
 static Node *parse_simple_command(Parser *p);
 static Node *parse_if(Parser *p);
 static Node *parse_while(Parser *p);
+static Node *parse_until(Parser *p);
 static Node *parse_for(Parser *p);
 static Node *parse_funcdef_kw(Parser *p);
 static Node *parse_funcdef_parens(Parser *p, size_t namelen);
 static Node *parse_case(Parser *p);
 static Node *parse_switch(Parser *p);
+static Node *parse_cond(Parser *p);
 static bool parse_stmt_list(Parser *p, Node *block, const char **stops);
 
 static void set_error(Parser *p, const char *fmt, ...) {
@@ -154,9 +156,12 @@ static Node *parse_and_or_bg(Parser *p) {
 }
 
 static Node *parse_pipeline(Parser *p) {
+    bool neg = false;
+    while (word_is(p, "!")) { neg = !neg; p_advance(p); }
+
     Node *first = parse_command(p);
     if (!first) return NULL;
-    if (p->cur.type != TOK_PIPE) return first;
+    if (p->cur.type != TOK_PIPE) { if (neg) first->negate = !first->negate; return first; }
     Node *pipe = node_new(N_PIPELINE);
     node_add_child(pipe, first);
     while (p->cur.type == TOK_PIPE) {
@@ -166,6 +171,7 @@ static Node *parse_pipeline(Parser *p) {
         if (!next) { node_free(pipe); return NULL; }
         node_add_child(pipe, next);
     }
+    if (neg) pipe->negate = !pipe->negate;
     return pipe;
 }
 
@@ -176,10 +182,12 @@ static Node *parse_command(Parser *p) {
     }
     if (strcmp(p->cur.text, "if") == 0) return parse_if(p);
     if (strcmp(p->cur.text, "while") == 0) return parse_while(p);
+    if (strcmp(p->cur.text, "until") == 0) return parse_until(p);
     if (strcmp(p->cur.text, "for") == 0) return parse_for(p);
     if (strcmp(p->cur.text, "function") == 0) return parse_funcdef_kw(p);
     if (strcmp(p->cur.text, "case") == 0) return parse_case(p);
     if (strcmp(p->cur.text, "switch") == 0) return parse_switch(p);
+    if (strcmp(p->cur.text, "[[") == 0) return parse_cond(p);
     {
         size_t tl = strlen(p->cur.text);
         if (tl >= 5 && str_has_prefix(p->cur.text, "((") && p->cur.text[tl-1] == ')' && p->cur.text[tl-2] == ')') {
@@ -417,6 +425,24 @@ static Node *parse_while(Parser *p) {
     return n;
 }
 
+static Node *parse_until(Parser *p) {
+    p_advance(p); /* until */
+    Node *cond = parse_and_or_bg(p);
+    if (!cond) return NULL;
+    skip_separators(p);
+    bool bash_style = false;
+    if (word_is(p, "do")) { p_advance(p); bash_style = true; }
+    const char *stop_done[] = { "done", NULL };
+    const char *stop_end[] = { "end", NULL };
+    Node *body = parse_block(p, bash_style ? stop_done : stop_end);
+    if (!body) { node_free(cond); return NULL; }
+    if (!expect_word(p, bash_style ? "done" : "end")) { node_free(cond); node_free(body); return NULL; }
+    Node *n = node_new(N_UNTIL);
+    node_add_child(n, cond);
+    node_add_child(n, body);
+    return n;
+}
+
 static Node *parse_for(Parser *p) {
     p_advance(p); /* for */
     if (p->cur.type != TOK_WORD) { set_error(p, "syntax error: expected loop variable name"); return NULL; }
@@ -550,6 +576,46 @@ static Node *parse_switch(Parser *p) {
     }
     p_advance(p); /* end */
     return n;
+}
+
+/* bash: [[ expr ]] -- an extended test expression. Atoms are runs of WORD
+ * tokens (an optional leading "!" negates the atom); "&&"/"||" between
+ * atoms lex as ordinary TOK_AND/TOK_OR, so the same short-circuiting
+ * N_AND/N_OR nodes used for shell-level "&&"/"||" are reused here.
+ * Parenthesized sub-grouping is not supported (see README limitations). */
+static Node *parse_cond_atom(Parser *p) {
+    bool neg = false;
+    while (word_is(p, "!")) { neg = !neg; p_advance(p); }
+    if (p->cur.type != TOK_WORD || strcmp(p->cur.text, "]]") == 0) {
+        set_error(p, "syntax error: expected a test expression after '[['");
+        return NULL;
+    }
+    Node *n = node_new(N_CONDATOM);
+    while (p->cur.type == TOK_WORD && strcmp(p->cur.text, "]]") != 0) {
+        sv_push_dup(&n->argv, p->cur.text);
+        p_advance(p);
+    }
+    n->negate = neg;
+    return n;
+}
+
+static Node *parse_cond(Parser *p) {
+    p_advance(p); /* [[ */
+    Node *left = parse_cond_atom(p);
+    if (!left) return NULL;
+    while (p->cur.type == TOK_AND || p->cur.type == TOK_OR) {
+        NodeType nt = (p->cur.type == TOK_AND) ? N_AND : N_OR;
+        p_advance(p);
+        skip_newlines(p);
+        Node *right = parse_cond_atom(p);
+        if (!right) { node_free(left); return NULL; }
+        Node *comb = node_new(nt);
+        node_add_child(comb, left);
+        node_add_child(comb, right);
+        left = comb;
+    }
+    if (!expect_word(p, "]]")) { node_free(left); return NULL; }
+    return left;
 }
 
 /* ---------------- entry point ---------------- */

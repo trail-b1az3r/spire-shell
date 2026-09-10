@@ -11,11 +11,13 @@ typedef enum {
     N_SEQ,      /* children run in order, separated by ; or newline              */
     N_IF,       /* children[0]=cond children[1]=then children[2]=else(or NULL)   */
     N_WHILE,    /* children[0]=cond children[1]=body                             */
+    N_UNTIL,    /* children[0]=cond children[1]=body (loops while cond is false)  */
     N_FOR,      /* for_var/for_words, children[0]=body                           */
     N_FUNCDEF,  /* func_name, children[0]=body                                   */
     N_BLOCK,    /* children = list of statements (function/if/while/for bodies)  */
     N_CASE,     /* case_subject; children alternate [patterns(N_CMD.argv), body(N_BLOCK)]... */
-    N_SUBSHELL  /* children[0] = body, runs in a forked, state-isolated child     */
+    N_SUBSHELL, /* children[0] = body, runs in a forked, state-isolated child     */
+    N_CONDATOM  /* one `[[ ... ]]` test atom: argv holds its raw words            */
 } NodeType;
 
 typedef enum {
@@ -52,6 +54,7 @@ typedef struct Node {
     size_t children_cap;
 
     bool background;        /* trailing & */
+    bool negate;             /* leading ! (pipeline negation, or a [[ ]] atom's !) */
 
     /* N_FOR */
     char *for_var;

@@ -259,6 +259,139 @@ static void append_array_multi(dstr_t *cur, strvec_t *out, strvec_t *elems) {
     }
 }
 
+/* ---------------- brace expansion: {a,b,c} and {1..5}[..step] ---------------- */
+
+/* Splits `body` on top-level (unquoted, unnested) commas. */
+static void split_top_level_commas(const char *body, strvec_t *out) {
+    size_t n = strlen(body);
+    size_t start = 0;
+    int depth = 0;
+    bool insq = false, indq = false;
+    for (size_t i = 0; i < n; i++) {
+        char c = body[i];
+        if (c == '\\' && !insq) { i++; continue; }
+        if (c == '\'' && !indq) { insq = !insq; continue; }
+        if (c == '"' && !insq) { indq = !indq; continue; }
+        if (insq || indq) continue;
+        if (c == '{') depth++;
+        else if (c == '}') depth--;
+        else if (c == ',' && depth == 0) { sv_push(out, xstrndup(body + start, i - start)); start = i + 1; }
+    }
+    sv_push(out, xstrndup(body + start, n - start));
+}
+
+/* Recognizes "X..Y" or "X..Y..STEP" where X/Y are both integers (optionally
+ * zero-padded, which is preserved) or both single letters. */
+static bool try_range(const char *body, strvec_t *out) {
+    char *copy = xstrdup(body);
+    char *p1 = strstr(copy, "..");
+    if (!p1) { free(copy); return false; }
+    *p1 = '\0';
+    char *rest = p1 + 2;
+    char *p2 = strstr(rest, "..");
+    long step = 1;
+    if (p2) { *p2 = '\0'; long s = strtol(p2 + 2, NULL, 10); step = s == 0 ? 1 : labs(s); }
+
+    const char *xs = copy, *ys = rest;
+    size_t xl = strlen(xs), yl = strlen(ys);
+    bool numeric = xl > 0 && yl > 0;
+    for (size_t k = 0; numeric && k < xl; k++)
+        if (!isdigit((unsigned char)xs[k]) && !(k == 0 && (xs[k] == '-' || xs[k] == '+'))) numeric = false;
+    for (size_t k = 0; numeric && k < yl; k++)
+        if (!isdigit((unsigned char)ys[k]) && !(k == 0 && (ys[k] == '-' || ys[k] == '+'))) numeric = false;
+
+    if (numeric) {
+        long lo = strtol(xs, NULL, 10), hi = strtol(ys, NULL, 10);
+        bool pad = (xl > 1 && xs[0] == '0') || (yl > 1 && ys[0] == '0');
+        int width = pad ? (int)(xl > yl ? xl : yl) : 0;
+        char buf[40];
+        if (lo <= hi) for (long v = lo; v <= hi; v += step) {
+            if (pad) snprintf(buf, sizeof(buf), "%0*ld", width, v); else snprintf(buf, sizeof(buf), "%ld", v);
+            sv_push_dup(out, buf);
+        } else for (long v = lo; v >= hi; v -= step) {
+            if (pad) snprintf(buf, sizeof(buf), "%0*ld", width, v); else snprintf(buf, sizeof(buf), "%ld", v);
+            sv_push_dup(out, buf);
+        }
+        free(copy);
+        return true;
+    }
+    if (xl == 1 && yl == 1 && isalpha((unsigned char)xs[0]) && isalpha((unsigned char)ys[0])) {
+        char lo = xs[0], hi = ys[0];
+        char buf[2] = { 0, 0 };
+        if (lo <= hi) for (char v = lo; v <= hi; v = (char)(v + step)) { buf[0] = v; sv_push_dup(out, buf); }
+        else for (char v = lo; v >= hi; v = (char)(v - step)) { buf[0] = v; sv_push_dup(out, buf); }
+        free(copy);
+        return true;
+    }
+    free(copy);
+    return false;
+}
+
+/* Finds the first unquoted '{' whose matching '}' delimits a body with a
+ * top-level comma or a valid ".." range -- i.e. an actually-expandable
+ * brace group, as opposed to a literal "{like this}". */
+static bool find_brace_group(const char *s, size_t *open_at, size_t *close_at) {
+    size_t n = strlen(s);
+    bool insq = false, indq = false;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (c == '\\' && !insq) { i++; continue; }
+        if (c == '\'' && !indq) { insq = !insq; continue; }
+        if (c == '"' && !insq) { indq = !indq; continue; }
+        if (insq || indq) continue;
+        if (c != '{') continue;
+
+        int depth = 1;
+        size_t j = i + 1;
+        bool has_comma = false, has_dots = false;
+        bool jsq = false, jdq = false;
+        while (j < n && depth > 0) {
+            char cj = s[j];
+            if (cj == '\\' && !jsq) { j += 2; continue; }
+            if (cj == '\'' && !jdq) { jsq = !jsq; j++; continue; }
+            if (cj == '"' && !jsq) { jdq = !jdq; j++; continue; }
+            if (!jsq && !jdq) {
+                if (cj == '{') depth++;
+                else if (cj == '}') { depth--; if (depth == 0) break; }
+                else if (cj == ',' && depth == 1) has_comma = true;
+                else if (cj == '.' && depth == 1 && j + 1 < n && s[j+1] == '.') has_dots = true;
+            }
+            j++;
+        }
+        if (j < n && depth == 0 && (has_comma || has_dots)) { *open_at = i; *close_at = j; return true; }
+        i = (j < n) ? j : n - 1; /* skip past this non-expandable group and keep scanning */
+    }
+    return false;
+}
+
+static void brace_expand_rec(const char *s, strvec_t *out, int depth) {
+    size_t open_at, close_at;
+    if (depth > 8 || !find_brace_group(s, &open_at, &close_at)) { sv_push_dup(out, s); return; }
+    char *pre = xstrndup(s, open_at);
+    char *body = xstrndup(s + open_at + 1, close_at - open_at - 1);
+    char *post = xstrdup(s + close_at + 1);
+
+    strvec_t alts; sv_init(&alts);
+    split_top_level_commas(body, &alts);
+    if (alts.count <= 1) {
+        sv_free(&alts); sv_init(&alts);
+        if (!try_range(body, &alts)) { sv_free(&alts); sv_push_dup(out, s); free(pre); free(body); free(post); return; }
+    }
+    for (size_t i = 0; i < alts.count; i++) {
+        dstr_t combined; ds_init(&combined);
+        ds_append(&combined, pre); ds_append(&combined, alts.items[i]); ds_append(&combined, post);
+        brace_expand_rec(combined.data, out, depth + 1);
+        ds_free(&combined);
+    }
+    sv_free(&alts);
+    free(pre); free(body); free(post);
+}
+
+/* raw text -> one or more raw texts, expanding {a,b,c} / {1..5} groups.
+ * Quote-aware: braces inside '...' or "..." are left untouched, matching
+ * bash (brace expansion only sees unquoted braces). */
+static void brace_expand(const char *raw, strvec_t *out) { brace_expand_rec(raw, out, 0); }
+
 static void expand_word_impl(const char *raw, strvec_t *out, bool do_glob) {
     dstr_t cur; ds_init(&cur);
     bool force_emit = false;
@@ -387,7 +520,12 @@ static void expand_word_impl(const char *raw, strvec_t *out, bool do_glob) {
     ds_free(&cur);
 }
 
-void expand_word(const char *raw, strvec_t *out) { expand_word_impl(raw, out, true); }
+void expand_word(const char *raw, strvec_t *out) {
+    strvec_t braced; sv_init(&braced);
+    brace_expand(raw, &braced);
+    for (size_t i = 0; i < braced.count; i++) expand_word_impl(braced.items[i], out, true);
+    sv_free(&braced);
+}
 
 char *expand_word_single(const char *raw) {
     strvec_t tmp; sv_init(&tmp);

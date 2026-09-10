@@ -120,6 +120,34 @@ static void kill_range(LState *s, size_t from, size_t to) {
     s->cursor = from;
 }
 
+/* Alt/Meta word motion: skip current run of spaces, then the run of
+ * non-space beyond it (forward), or the mirror image (backward). */
+static size_t word_forward_pos(LState *s) {
+    size_t i = s->cursor;
+    while (i < s->buf.len && isspace((unsigned char)s->buf.data[i])) i++;
+    while (i < s->buf.len && !isspace((unsigned char)s->buf.data[i])) i++;
+    return i;
+}
+
+static size_t word_backward_pos(LState *s) {
+    size_t i = s->cursor;
+    while (i > 0 && isspace((unsigned char)s->buf.data[i-1])) i--;
+    while (i > 0 && !isspace((unsigned char)s->buf.data[i-1])) i--;
+    return i;
+}
+
+static void transpose_chars(LState *s) {
+    if (s->buf.len < 2) return;
+    size_t i = s->cursor;
+    if (i == 0) return;
+    if (i >= s->buf.len) i = s->buf.len - 1;
+    if (i == 0) return;
+    char tmp = s->buf.data[i-1];
+    s->buf.data[i-1] = s->buf.data[i];
+    s->buf.data[i] = tmp;
+    if (s->cursor < s->buf.len) s->cursor++;
+}
+
 static size_t common_prefix_len(strvec_t *v) {
     if (v->count == 0) return 0;
     size_t plen = strlen(v->items[0]);
@@ -131,7 +159,51 @@ static size_t common_prefix_len(strvec_t *v) {
     return plen;
 }
 
-static void do_complete(LState *s, const char *prompt_rendered) {
+/* persists across consecutive Tab presses within one lineedit_read call;
+ * reset (via complete_state_reset) on any other keystroke. */
+typedef struct {
+    bool active;       /* a menu-cycle is in progress */
+    strvec_t cands;
+    size_t idx;          /* candidate that would be inserted next */
+    size_t word_start;   /* where the completed word begins in the buffer */
+} CompleteState;
+
+static void complete_state_reset(CompleteState *cs) {
+    if (cs->active) sv_free(&cs->cands);
+    cs->active = false;
+    cs->idx = 0;
+}
+
+/* dirs get the path color, $vars the variable color, everything else the
+ * command color -- cheap enough of a heuristic to not need re-stat'ing. */
+static void print_candidate_list(strvec_t *cands) {
+    dstr_t list; ds_init(&list);
+    ds_append_c(&list, '\n');
+    for (size_t i = 0; i < cands->count; i++) {
+        const char *c = cands->items[i];
+        size_t clen = strlen(c);
+        const char *cls = "command";
+        if (clen > 0 && c[0] == '$') cls = "variable";
+        else if (clen > 0 && c[clen - 1] == '/') cls = "path";
+        color_wrap_n(&list, config_color(cls), c, clen);
+        ds_append(&list, (i + 1 < cands->count) ? "  " : "\n");
+    }
+    wr(list.data, list.len);
+    ds_free(&list);
+}
+
+static void do_complete(LState *s, const char *prompt_rendered, CompleteState *cs) {
+    if (cs->active) {
+        /* consecutive Tab: cycle to the next candidate in place */
+        kill_range(s, cs->word_start, s->cursor);
+        s->cursor = cs->word_start;
+        const char *pick = cs->cands.items[cs->idx];
+        for (const char *p = pick; *p; p++) insert_char(s, *p);
+        cs->idx = (cs->idx + 1) % cs->cands.count;
+        redraw(prompt_rendered, s);
+        return;
+    }
+
     strvec_t cands; sv_init(&cands);
     size_t word_start;
     complete_line(s->buf.data, s->cursor, &cands, &word_start);
@@ -143,21 +215,18 @@ static void do_complete(LState *s, const char *prompt_rendered) {
         kill_range(s, word_start, s->cursor);
         s->cursor = word_start;
         for (size_t i = 0; i < cp; i++) insert_char(s, cands.items[0][i]);
-    } else if (cands.count == 1) {
-        /* nothing to extend but a single candidate: still normalize it in */
     }
 
     if (cands.count > 1) {
-        dstr_t list; ds_init(&list);
-        ds_append_c(&list, '\n');
-        for (size_t i = 0; i < cands.count; i++) {
-            ds_append(&list, cands.items[i]);
-            ds_append(&list, (i + 1 < cands.count) ? "  " : "\n");
-        }
-        wr(list.data, list.len);
-        ds_free(&list);
+        print_candidate_list(&cands);
+        /* next Tab (with the buffer unchanged since) starts cycling */
+        cs->active = true;
+        cs->cands = cands;
+        cs->idx = 0;
+        cs->word_start = word_start;
+    } else {
+        sv_free(&cands);
     }
-    sv_free(&cands);
     redraw(prompt_rendered, s);
 }
 
@@ -184,12 +253,14 @@ char *lineedit_read(const char *prompt_fmt) {
     int hist_nav = 0;
     char *saved_line = NULL;
     bool eof = false;
+    CompleteState cs; memset(&cs, 0, sizeof(cs));
 
     redraw(prompt_rendered, &s);
 
     for (;;) {
         int c = read_byte();
         if (c < 0) { eof = (s.buf.len == 0); break; }
+        if (c != 9) complete_state_reset(&cs); /* any non-Tab key ends a completion cycle */
 
         if (c == '\r' || c == '\n') { wr("\r\n", 2); break; }
 
@@ -226,7 +297,68 @@ char *lineedit_read(const char *prompt_fmt) {
             continue;
         }
         if (c == 9) { /* Tab */
-            do_complete(&s, prompt_rendered);
+            do_complete(&s, prompt_rendered, &cs);
+            continue;
+        }
+        if (c == 20) { /* Ctrl-T: transpose the two characters before the cursor */
+            transpose_chars(&s);
+            redraw(prompt_rendered, &s);
+            continue;
+        }
+        if (c == 18) { /* Ctrl-R: reverse incremental history search */
+            dstr_t query; ds_init(&query);
+            dstr_t original; ds_init(&original); ds_append(&original, s.buf.data);
+            size_t original_cursor = s.cursor;
+            int back = 0;
+            const char *match = NULL;
+            bool cancelled = false;
+            for (;;) {
+                dstr_t line; ds_init(&line);
+                ds_append(&line, "\r\x1b[K");
+                if (!match && query.len > 0) ds_append(&line, "(failed reverse-i-search)`");
+                else ds_append(&line, "(reverse-i-search)`");
+                ds_append(&line, query.data);
+                ds_append(&line, "': ");
+                if (match) ds_append(&line, match);
+                wr(line.data, line.len);
+                ds_free(&line);
+
+                int sc = read_byte();
+                if (sc < 0) { cancelled = true; break; }
+                if (sc == 18) { /* search again, older */
+                    if (query.len > 0) {
+                        int nb = history_find_substring(query.data, back);
+                        if (nb) { back = nb; match = history_get_relative(back); }
+                        else wr("\a", 1);
+                    }
+                    continue;
+                }
+                if (sc == 127 || sc == 8) {
+                    if (query.len > 0) { query.len--; query.data[query.len] = '\0'; }
+                    back = 0; match = NULL;
+                    if (query.len > 0) {
+                        int nb = history_find_substring(query.data, 0);
+                        if (nb) { back = nb; match = history_get_relative(nb); }
+                    }
+                    continue;
+                }
+                if (sc == 7 || sc == 27) { cancelled = true; break; } /* Ctrl-G / ESC */
+                if (sc == 3) { cancelled = true; break; } /* Ctrl-C */
+                if (sc == '\r' || sc == '\n') { break; }
+                if (sc >= 32 && sc < 127) {
+                    ds_append_c(&query, (char)sc);
+                    back = 0; match = NULL;
+                    int nb = history_find_substring(query.data, 0);
+                    if (nb) { back = nb; match = history_get_relative(nb); }
+                    continue;
+                }
+                break; /* any other key: stop searching, then let the normal loop handle it next time */
+            }
+            if (cancelled) { ds_clear(&s.buf); ds_append(&s.buf, original.data); s.cursor = original_cursor; }
+            else if (match) { ds_clear(&s.buf); ds_append(&s.buf, match); s.cursor = s.buf.len; }
+            ds_free(&query); ds_free(&original);
+            hist_nav = 0;
+            redraw(prompt_rendered, &s);
             continue;
         }
         if (c == 27) { /* ESC sequence */
@@ -249,6 +381,16 @@ char *lineedit_read(const char *prompt_fmt) {
                 else if (c2 == 'D') { if (s.cursor > 0) s.cursor--; }
                 else if (c2 == 'H') { s.cursor = 0; }
                 else if (c2 == 'F') { goto_end_or_accept(&s); }
+                else if (c2 == '1' && c1 == '[') {
+                    /* xterm Ctrl-Arrow: ESC [ 1 ; 5 C/D -- word motion */
+                    int c3 = read_byte();
+                    if (c3 == ';') {
+                        int c4 = read_byte();
+                        int c5 = read_byte();
+                        if (c4 == '5' && c5 == 'C') s.cursor = word_forward_pos(&s);
+                        else if (c4 == '5' && c5 == 'D') s.cursor = word_backward_pos(&s);
+                    }
+                }
                 else if (c2 >= '0' && c2 <= '9') {
                     int c3 = read_byte();
                     if (c3 == '~') {
@@ -258,6 +400,18 @@ char *lineedit_read(const char *prompt_fmt) {
                     }
                 }
                 redraw(prompt_rendered, &s);
+            } else if (c1 == 'f' || c1 == 'F') { /* Alt-F: word forward */
+                s.cursor = word_forward_pos(&s);
+                redraw(prompt_rendered, &s);
+            } else if (c1 == 'b' || c1 == 'B') { /* Alt-B: word backward */
+                s.cursor = word_backward_pos(&s);
+                redraw(prompt_rendered, &s);
+            } else if (c1 == 'd' || c1 == 'D') { /* Alt-D: delete word forward */
+                kill_range(&s, s.cursor, word_forward_pos(&s));
+                redraw(prompt_rendered, &s);
+            } else if (c1 == 127 || c1 == 8) { /* Alt-Backspace: delete word backward */
+                kill_range(&s, word_backward_pos(&s), s.cursor);
+                redraw(prompt_rendered, &s);
             }
             continue;
         }
@@ -265,6 +419,7 @@ char *lineedit_read(const char *prompt_fmt) {
         /* other control chars: ignore */
     }
 
+    complete_state_reset(&cs);
     raw_off();
     free(saved_line);
     free(prompt_rendered);
