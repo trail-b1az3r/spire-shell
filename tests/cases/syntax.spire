@@ -1,0 +1,21 @@
+# fish and bash control-flow syntax
+begin; echo fish-begin; end
+false; or echo "fish or"
+true; and echo "fish and"
+not false && echo not-ok
+! false && echo bang-ok
+function greet -a who -d "say hi"; echo "hi $who"; end
+greet bob
+f() { echo "args: $# [$1] [$2]"; for a; do echo "- $a"; done; }
+f "a b" c
+[[ ( a == a ) && ! ( b == c ) ]] && echo grouped
+[[ abc < abd ]] && echo ordered
+[[ foo.txt == *.txt ]] && echo glob-match
+[[ abc123 =~ ^[a-z]+[0-9]+$ ]] && echo regex-match
+switch hello; case h*; echo fish-switch; case '*'; echo nope; end
+case "b" in a|b) echo bash-case ;; *) echo nope ;; esac
+for x in 1 2; echo fish-for $x; end
+i=0; while (( i < 2 )); do echo while $i; (( i++ )); done
+until test $i -eq 0; i=$((i-1)); end; echo until $i
+set -- x y z; echo $# $2 a#b; shift; echo "$@" # a comment
+echo {a,b}{1,2} {01..03} {5..1..2}

@@ -5,6 +5,11 @@
 
 #define CFG_BUCKETS 128
 
+/* user@host ~/dir (branch*) ▲❯   -- the arrow turns red after a failed command */
+#define DEFAULT_PROMPT "%F{cyan}%n%f@%F{cyan}%m%f %F{yellow}%~%f %F{brightblack}%G%f%(?.%F{green}.%F{red})▲❯%f "
+/* right side: exit status of a failed command, slow-command duration, job count */
+#define DEFAULT_RPROMPT "%(?..%F{red}✘ %?%f )%F{yellow}%c%f%F{brightblack}%J%f"
+
 typedef struct CfgEntry {
     char *key;
     char *value;
@@ -59,7 +64,8 @@ void config_init(void) {
     /* defaults: fish-like palette, but fully overridable. ▲ stands in for
      * a spire/tower glyph — swap for 🗼 in the config if your terminal
      * has good emoji coverage. */
-    config_set("prompt", "%F{cyan}%n%f@%F{cyan}%m%f %F{yellow}%~%f %F{brightblack}%g%f %F{green}▲❯%f ");
+    config_set("prompt", DEFAULT_PROMPT);
+    config_set("rprompt", DEFAULT_RPROMPT);
     config_set("color.command", "green");
     config_set("color.command_invalid", "red");
     config_set("color.builtin", "blue");
@@ -74,6 +80,18 @@ void config_init(void) {
     config_set("color.flag", "brightcyan");
     config_set("color.suggestion", "brightblack");
     config_set("color.text", "default");
+    config_set("color.function", "brightblue");
+    config_set("color.redirect", "brightmagenta");
+    config_set("color.escape", "brightcyan");
+    config_set("color.description", "brightblack");
+    config_set("color.selection", "reverse");
+    config_set("color.completion", "default");
+    config_set("color.error", "red");
+    config_set("prompt.duration_threshold", "2000");
+    config_set("autocd", "yes");
+    config_set("autosuggest", "yes");
+    config_set("complete.parse_help", "yes");
+    config_set("highlight.valid_paths", "yes");
     config_set("history.size", "5000");
 }
 
@@ -146,7 +164,8 @@ void config_load_default(void) {
         if (f) {
             fprintf(f,
                 "# spire configuration - see `man spire` / README for the full key list\n"
-                "prompt = \"%%F{cyan}%%n%%f@%%F{cyan}%%m%%f %%F{yellow}%%~%%f %%F{brightblack}%%g%%f %%F{green}▲❯%%f \"\n"
+                "prompt = \"%%F{cyan}%%n%%f@%%F{cyan}%%m%%f %%F{yellow}%%~%%f %%F{brightblack}%%G%%f%%(?.%%F{green}.%%F{red})▲❯%%f \"\n"
+                "rprompt = \"%%(?..%%F{red}✘ %%?%%f )%%F{yellow}%%c%%f%%F{brightblack}%%J%%f\"\n"
                 "color.command = green\n"
                 "color.command_invalid = red\n"
                 "color.builtin = blue\n"
@@ -160,6 +179,8 @@ void config_load_default(void) {
                 "color.array = brightmagenta\n"
                 "color.flag = brightcyan\n"
                 "color.suggestion = brightblack\n"
+                "color.redirect = brightmagenta\n"
+                "color.description = brightblack\n"
                 "history.size = 5000\n"
                 "modules = \n");
             fclose(f);

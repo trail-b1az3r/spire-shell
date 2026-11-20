@@ -10,6 +10,7 @@ size_t history_count(void);
 const char *history_get(size_t index_from_oldest); /* NULL if out of range */
 const char *history_get_relative(int back);   /* 1 = most recent, 2 = one before, ... */
 void history_print(void);
+void history_clear(void);           /* in memory and on disk */
 
 /* Most recent entry that starts with `prefix` (case-sensitive), other than
  * an exact match. NULL if none or prefix is empty. Used for fish-style

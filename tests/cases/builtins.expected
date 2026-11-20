@@ -1,0 +1,46 @@
+name  | 3.14|007|ff|'a b'
+a-b-c-
+00042
+a^IbA|$
+eval 2
+builtin
+keyword
+command-v-ok
+r
+1 y
+a=[]
+HELLO
+5
+a
+b
+c
+x-y-z
+f00 b00
+host at me
+123
+bcd
+a
+b
+c
+7
+2.5
+1024
+0.33
+3
+has-b
+opt a 
+opt b val
+opt c 
+test-ok
+paren-ok
+p2 3
+root|0:0
+pipefail=1
+0 1 0 0 1 0
+errexit=[]
+waited=0
+abbr -a -- gco 'git checkout'
+b 3
+set-q-ok
+end
+trapped EXIT

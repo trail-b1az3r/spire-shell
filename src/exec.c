@@ -10,6 +10,7 @@
 #include "lexer.h"
 #include "parser.h"
 #include <ctype.h>
+#include <sys/stat.h>
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -19,12 +20,28 @@
 #include <sys/types.h>
 #include <fnmatch.h>
 #include <regex.h>
+#include <time.h>
+#include <sys/time.h>
+#include <sys/resource.h>
+#include "highlight.h"
+#include "complete.h"
+#include "config.h"
 
 int g_exec_depth = 0;
 volatile bool g_should_exit = false;
 int g_exit_code = 0;
 bool g_shell_is_interactive = false;
 pid_t g_shell_pgid = 0;
+
+bool g_opt_errexit = false;
+bool g_opt_xtrace = false;
+bool g_opt_pipefail = false;
+bool g_opt_nounset = false;
+long g_last_duration_ms = 0;
+
+/* >0 while evaluating an if/while condition or the left side of &&/||,
+ * where a failing command must not trigger `set -e` */
+static int g_cond_depth = 0;
 
 static bool g_break_flag = false;
 static bool g_continue_flag = false;
@@ -35,6 +52,8 @@ void exec_signal_continue(void) { g_continue_flag = true; }
 void exec_signal_return(int code) { g_return_flag = true; g_exit_code = code; }
 
 static int exec_stmt(Node *n);
+static int exec_simple_command(Node *n);
+static int exec_cond_wrapped_cmd(Node *n) { g_cond_depth++; int s = exec_simple_command(n); g_cond_depth--; return s; }
 
 static void flush_exit(int code) { fflush(NULL); _exit(code); }
 
@@ -42,7 +61,164 @@ static void set_status(int st) {
     char buf[16];
     snprintf(buf, sizeof(buf), "%d", st);
     var_set("?", buf, false);
+    var_set("status", buf, false);
     g_exit_code = st;
+}
+
+static void set_pipestatus(int *sts, size_t n) {
+    strvec_t v; sv_init(&v);
+    char buf[16];
+    for (size_t i = 0; i < n; i++) { snprintf(buf, sizeof(buf), "%d", sts[i]); sv_push_dup(&v, buf); }
+    array_set("PIPESTATUS", &v);
+    array_set("pipestatus", &v);
+    sv_free(&v);
+}
+
+static int wait_status_code(int st) {
+    if (WIFEXITED(st)) return WEXITSTATUS(st);
+    if (WIFSIGNALED(st)) return 128 + WTERMSIG(st);
+    return 1;
+}
+
+/* ---------- positional parameters ---------- */
+
+static strvec_t g_pos;
+static bool g_pos_init = false;
+
+void exec_set_positional(int count, char **params) {
+    if (!g_pos_init) { sv_init(&g_pos); g_pos_init = true; }
+    char buf[32];
+    for (size_t i = (size_t)count; i < g_pos.count; i++) { snprintf(buf, sizeof(buf), "%zu", i + 1); var_unset(buf); }
+    strvec_t fresh; sv_init(&fresh);
+    for (int i = 0; i < count; i++) sv_push_dup(&fresh, params[i]);
+    sv_free(&g_pos);
+    g_pos = fresh;
+    dstr_t joined; ds_init(&joined);
+    for (size_t i = 0; i < g_pos.count; i++) {
+        snprintf(buf, sizeof(buf), "%zu", i + 1);
+        var_set(buf, g_pos.items[i], false);
+        if (i) ds_append_c(&joined, ' ');
+        ds_append(&joined, g_pos.items[i]);
+    }
+    snprintf(buf, sizeof(buf), "%zu", g_pos.count);
+    var_set("#", buf, false);
+    var_set("@", joined.data, false);
+    var_set("*", joined.data, false);
+    array_set("argv", &g_pos);
+    ds_free(&joined);
+}
+
+size_t exec_positional_count(void) { return g_pos_init ? g_pos.count : 0; }
+const char *exec_positional_get(size_t i) { return (g_pos_init && i < g_pos.count) ? g_pos.items[i] : NULL; }
+
+/* ---------- traps ---------- */
+
+static char *g_traps[TRAP_SLOTS];
+static volatile sig_atomic_t g_trap_pending[TRAP_SLOTS];
+static volatile sig_atomic_t g_any_trap_pending = 0;
+static bool g_in_trap = false;
+
+static void trap_handler(int sig) {
+    if (sig > 0 && sig < TRAP_SLOTS) { g_trap_pending[sig] = 1; g_any_trap_pending = 1; }
+}
+
+void exec_set_trap(int slot, const char *cmd) {
+    if (slot < 0 || slot >= TRAP_SLOTS) return;
+    free(g_traps[slot]);
+    g_traps[slot] = cmd ? xstrdup(cmd) : NULL;
+    if (slot == 0 || slot == TRAP_ERR) return;
+    if (!cmd) {
+        bool shell_ignores = g_shell_is_interactive &&
+            (slot == SIGINT || slot == SIGQUIT || slot == SIGTSTP || slot == SIGTTIN || slot == SIGTTOU);
+        signal(slot, shell_ignores ? SIG_IGN : SIG_DFL);
+    } else if (!*cmd) {
+        signal(slot, SIG_IGN);
+    } else {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = trap_handler;
+        sigemptyset(&sa.sa_mask);
+        sigaction(slot, &sa, NULL);
+    }
+}
+
+const char *exec_get_trap(int slot) { return (slot >= 0 && slot < TRAP_SLOTS) ? g_traps[slot] : NULL; }
+
+static void run_trap_slot(int slot) {
+    if (!g_traps[slot] || !*g_traps[slot] || g_in_trap) return;
+    g_in_trap = true;
+    int saved = g_exit_code;
+    exec_source_string(g_traps[slot]);
+    set_status(saved);
+    g_in_trap = false;
+}
+
+void exec_run_pending_traps(void) {
+    if (!g_any_trap_pending) return;
+    g_any_trap_pending = 0;
+    for (int i = 1; i < TRAP_SLOTS; i++) {
+        if (g_trap_pending[i]) { g_trap_pending[i] = 0; run_trap_slot(i); }
+    }
+}
+
+void exec_run_exit_trap(void) {
+    if (g_traps[0]) {
+        char *cmd = g_traps[0];
+        g_traps[0] = NULL; /* run once */
+        g_in_trap = true;
+        bool was_exit = g_should_exit;
+        g_should_exit = false;
+        int code = g_exit_code;
+        exec_source_string(cmd);
+        g_exit_code = code;
+        g_should_exit = was_exit;
+        g_in_trap = false;
+        free(cmd);
+    }
+}
+
+/* in a forked child, traps set by the parent must not fire */
+static void reset_child_signals(void) {
+    signal(SIGINT, SIG_DFL);
+    signal(SIGQUIT, SIG_DFL);
+    signal(SIGTSTP, SIG_DFL);
+    signal(SIGTTIN, SIG_DFL);
+    signal(SIGTTOU, SIG_DFL);
+    for (int i = 1; i < TRAP_SLOTS && i < NSIG; i++) {
+        if (g_traps[i] && *g_traps[i]) signal(i, SIG_DFL);
+    }
+}
+
+/* ---------- process substitution ---------- */
+
+static int g_procsub_fds[64];
+static int g_procsub_n = 0;
+
+char *exec_procsub(const char *src, bool want_read) {
+    int pfd[2];
+    if (pipe(pfd) != 0) { sh_err("pipe: %s\n", strerror(errno)); return xstrdup("/dev/null"); }
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        reset_child_signals();
+        if (want_read) { dup2(pfd[1], STDOUT_FILENO); }
+        else { dup2(pfd[0], STDIN_FILENO); }
+        close(pfd[0]); close(pfd[1]);
+        g_exec_depth++;
+        int st = exec_source_string(src);
+        flush_exit(st);
+    }
+    int keep = want_read ? pfd[0] : pfd[1];
+    close(want_read ? pfd[1] : pfd[0]);
+    if (g_procsub_n < 64) g_procsub_fds[g_procsub_n++] = keep;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "/dev/fd/%d", keep);
+    return xstrdup(buf);
+}
+
+static void procsub_cleanup(void) {
+    for (int i = 0; i < g_procsub_n; i++) close(g_procsub_fds[i]);
+    g_procsub_n = 0;
 }
 
 /* ---------- alias-aware raw-word -> argv expansion ---------- */
@@ -232,67 +408,154 @@ static void restore_env_assigns(SavedVar *saved, int n) {
 
 /* ---------- redirection ---------- */
 
-static int apply_redirects(Redirect *r) {
-    for (; r; r = r->next) {
-        if (r->type == R_ERR_TO_OUT) { dup2(STDOUT_FILENO, STDERR_FILENO); continue; }
+typedef struct { int fd; int saved; } FdSave;
+typedef struct { FdSave items[32]; int n; } FdSaveList;
 
+/* remember fd's current state (once) before it is changed in-process */
+static void save_fd(FdSaveList *sv, int fd) {
+    if (!sv) return;
+    for (int i = 0; i < sv->n; i++) if (sv->items[i].fd == fd) return;
+    if (sv->n >= 32) return;
+    int saved = fcntl(fd, F_DUPFD_CLOEXEC, 10);
+    sv->items[sv->n].fd = fd;
+    sv->items[sv->n].saved = saved; /* -1: fd was closed before */
+    sv->n++;
+}
+
+static void restore_redirects(FdSaveList *sv) {
+    if (!sv) return;
+    fflush(stdout); fflush(stderr);
+    for (int i = sv->n - 1; i >= 0; i--) {
+        if (sv->items[i].saved >= 0) { dup2(sv->items[i].saved, sv->items[i].fd); close(sv->items[i].saved); }
+        else close(sv->items[i].fd);
+    }
+    sv->n = 0;
+}
+
+static bool all_digits(const char *s) {
+    if (!*s) return false;
+    for (; *s; s++) if (!isdigit((unsigned char)*s)) return false;
+    return true;
+}
+
+/* feeds `body` to `fd` through a pipe; small bodies are written directly,
+ * large ones from a child so the pipe buffer can't deadlock us */
+static int feed_text_to_fd(const char *body, int fd, FdSaveList *sv) {
+    int pfd[2];
+    if (pipe(pfd) != 0) { sh_err("pipe: %s\n", strerror(errno)); return -1; }
+    size_t len = strlen(body);
+    if (len < 60000) {
+        size_t off = 0;
+        while (off < len) { ssize_t w = write(pfd[1], body + off, len - off); if (w <= 0) break; off += (size_t)w; }
+    } else {
+        pid_t wpid = fork();
+        if (wpid == 0) {
+            close(pfd[0]);
+            size_t off = 0;
+            while (off < len) { ssize_t w = write(pfd[1], body + off, len - off); if (w <= 0) break; off += (size_t)w; }
+            _exit(0);
+        }
+    }
+    close(pfd[1]);
+    save_fd(sv, fd);
+    dup2(pfd[0], fd);
+    close(pfd[0]);
+    return 0;
+}
+
+/* Applies redirections to the current process. With `sv` non-NULL, every
+ * touched fd is saved first so restore_redirects() can undo it (used for
+ * builtins, functions and compound commands that run in the shell itself). */
+static int apply_redirects_ex(Redirect *r, FdSaveList *sv) {
+    fflush(stdout); fflush(stderr);
+    for (; r; r = r->next) {
         if (r->type == R_HEREDOC) {
             char *body = r->heredoc_no_expand ? xstrdup(r->heredoc_body) : expand_heredoc_body(r->heredoc_body);
-            int pfd[2];
-            if (pipe(pfd) != 0) {
-                fprintf(stderr, "spire: pipe: %s\n", strerror(errno));
-                free(body);
-                return -1;
-            }
-            /* write from a child so a heredoc body larger than the pipe
-             * buffer can't deadlock us */
-            pid_t wpid = fork();
-            if (wpid == 0) {
-                close(pfd[0]);
-                size_t len = strlen(body);
-                size_t off = 0;
-                while (off < len) {
-                    ssize_t w = write(pfd[1], body + off, len - off);
-                    if (w <= 0) break;
-                    off += (size_t)w;
-                }
-                close(pfd[1]);
-                _exit(0);
-            }
-            close(pfd[1]);
-            dup2(pfd[0], STDIN_FILENO);
-            close(pfd[0]);
+            int rc = feed_text_to_fd(body, r->fd, sv);
             free(body);
+            if (rc != 0) return -1;
+            continue;
+        }
+        if (r->type == R_HERESTRING) {
+            char *val = expand_word_single(r->target);
+            dstr_t d; ds_init(&d); ds_append(&d, val); ds_append_c(&d, '\n');
+            int rc = feed_text_to_fd(d.data, r->fd, sv);
+            ds_free(&d); free(val);
+            if (rc != 0) return -1;
             continue;
         }
 
         char *target = expand_word_single(r->target);
-        int fd, target_fd, flags;
-        switch (r->type) {
-            case R_IN:         flags = O_RDONLY; target_fd = STDIN_FILENO; break;
-            case R_OUT:         flags = O_WRONLY | O_CREAT | O_TRUNC;  target_fd = STDOUT_FILENO; break;
-            case R_APPEND:      flags = O_WRONLY | O_CREAT | O_APPEND; target_fd = STDOUT_FILENO; break;
-            case R_ERR:         flags = O_WRONLY | O_CREAT | O_TRUNC;  target_fd = STDERR_FILENO; break;
-            case R_ERR_APPEND:  flags = O_WRONLY | O_CREAT | O_APPEND; target_fd = STDERR_FILENO; break;
-            case R_OUT_ERR:     flags = O_WRONLY | O_CREAT | O_TRUNC;  target_fd = -1; break;
-            default:            flags = O_RDONLY; target_fd = STDIN_FILENO; break;
+        if (r->type == R_DUP) {
+            if (strcmp(target, "-") == 0) { save_fd(sv, r->fd); close(r->fd); free(target); continue; }
+            if (all_digits(target)) {
+                int src = atoi(target);
+                if (fcntl(src, F_GETFD) < 0) { sh_err("%s: bad file descriptor\n", target); free(target); return -1; }
+                save_fd(sv, r->fd);
+                if (src != r->fd) dup2(src, r->fd);
+                free(target);
+                continue;
+            }
+            /* `>&file` is the same as `&>file` */
         }
-        fd = open(target, flags, 0644);
+        int flags;
+        bool both = false;
+        switch (r->type) {
+            case R_IN:   flags = O_RDONLY; break;
+            case R_RDWR: flags = O_RDWR | O_CREAT; break;
+            case R_OUT:  flags = O_WRONLY | O_CREAT | O_TRUNC; break;
+            case R_APPEND: flags = O_WRONLY | O_CREAT | O_APPEND; break;
+            case R_OUT_ERR_APPEND: flags = O_WRONLY | O_CREAT | O_APPEND; both = true; break;
+            default: /* R_OUT_ERR, R_DUP-to-file */ flags = O_WRONLY | O_CREAT | O_TRUNC; both = true; break;
+        }
+        int fd = open(target, flags, 0644);
         if (fd < 0) {
-            fprintf(stderr, "spire: %s: %s\n", target, strerror(errno));
+            sh_err("%s: %s\n", target, strerror(errno));
             free(target);
             return -1;
         }
         free(target);
-        if (r->type == R_OUT_ERR) { dup2(fd, STDOUT_FILENO); dup2(fd, STDERR_FILENO); close(fd); }
-        else { dup2(fd, target_fd); close(fd); }
+        if (both) {
+            save_fd(sv, STDOUT_FILENO); save_fd(sv, STDERR_FILENO);
+            dup2(fd, STDOUT_FILENO); dup2(fd, STDERR_FILENO);
+            close(fd);
+        } else {
+            save_fd(sv, r->fd);
+            if (fd != r->fd) { dup2(fd, r->fd); close(fd); }
+        }
     }
     return 0;
 }
 
+static int apply_redirects(Redirect *r) { return apply_redirects_ex(r, NULL); }
+
 /* ---------- command resolution & execution ---------- */
 
 static char **argv_from_strvec(strvec_t *v) { return sv_to_argv(v); }
+
+static void report_exec_failure(const char *name, int err) {
+    if (err == ENOENT && !strchr(name, '/')) {
+        sh_err("command not found: %s\n", name);
+    } else {
+        sh_err("%s: %s\n", name, strerror(err));
+    }
+}
+
+/* waits for a foreground child/process group, handing it the terminal */
+static int wait_foreground(pid_t pid, const char *desc) {
+    if (g_shell_is_interactive) tcsetpgrp(STDIN_FILENO, pid);
+    int status;
+    while (waitpid(pid, &status, WUNTRACED) < 0 && errno == EINTR) {}
+    if (g_shell_is_interactive) tcsetpgrp(STDIN_FILENO, g_shell_pgid);
+    if (WIFSTOPPED(status)) {
+        Job *j = job_add(pid, desc);
+        j->state = JOB_STOPPED;
+        fprintf(stderr, "\n[%d]+  Stopped                 %s\n", j->id, desc);
+        return 128 + WSTOPSIG(status);
+    }
+    if (WIFSIGNALED(status) && WTERMSIG(status) == SIGINT && g_shell_is_interactive) fputc('\n', stderr);
+    return wait_status_code(status);
+}
 
 /* Runs a resolved command (builtin, function, or external) in the CURRENT
  * process. For external commands this calls execve and does not return on
@@ -311,46 +574,161 @@ static int run_in_current_process(strvec_t *argv, bool allow_exec_replace) {
     BuiltinFn b = builtin_lookup(name);
     if (b) {
         int st = b((int)argv->count, cargv);
+        fflush(stdout);
         free(cargv);
         return st;
     }
     if (allow_exec_replace) {
         execvp(name, cargv);
-        fprintf(stderr, "spire: %s: %s\n", name, strerror(errno));
+        int err = errno;
+        report_exec_failure(name, err);
         free(cargv);
-        _exit(127);
-    } else {
-        pid_t pid = fork();
-        if (pid < 0) { fprintf(stderr, "spire: fork: %s\n", strerror(errno)); free(cargv); return 1; }
-        if (pid == 0) {
-            signal(SIGINT, SIG_DFL);
-            signal(SIGQUIT, SIG_DFL);
-            signal(SIGTSTP, SIG_DFL);
-            setpgid(0, 0);
-            execvp(name, cargv);
-            fprintf(stderr, "spire: %s: %s\n", name, strerror(errno));
-            flush_exit(127);
-        }
-        setpgid(pid, pid);
-        if (g_shell_is_interactive) { tcsetpgrp(STDIN_FILENO, pid); }
-        int status;
-        waitpid(pid, &status, WUNTRACED);
-        if (g_shell_is_interactive) { tcsetpgrp(STDIN_FILENO, g_shell_pgid); }
-        free(cargv);
-        if (WIFSTOPPED(status)) { job_add(pid, name)->state = JOB_STOPPED; return 128 + SIGTSTP; }
-        return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+        flush_exit(err == ENOENT ? 127 : 126);
     }
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid < 0) { sh_err("fork: %s\n", strerror(errno)); free(cargv); return 1; }
+    if (pid == 0) {
+        reset_child_signals();
+        setpgid(0, 0);
+        execvp(name, cargv);
+        int err = errno;
+        report_exec_failure(name, err);
+        flush_exit(err == ENOENT ? 127 : 126);
+    }
+    setpgid(pid, pid);
+    free(cargv);
+    return wait_foreground(pid, name);
 }
 
 static bool is_arith_cmd(Node *n) {
     return n->type == N_CMD && n->argv.count == 2 && strcmp(n->argv.items[0], "((") == 0;
 }
 
+static void xtrace_print(strvec_t *argv) {
+    const char *ps4 = var_get("PS4");
+    dstr_t d; ds_init(&d);
+    bool color = isatty(STDERR_FILENO);
+    if (color) ds_append(&d, "\x1b[90m");
+    ds_append(&d, ps4 ? ps4 : "+ ");
+    for (size_t i = 0; i < argv->count; i++) { if (i) ds_append_c(&d, ' '); ds_append(&d, argv->items[i]); }
+    if (color) ds_append(&d, "\x1b[0m");
+    ds_append_c(&d, '\n');
+    fflush(stdout);
+    fputs(d.data, stderr);
+    ds_free(&d);
+}
+
+/* The command isn't a function/builtin/alias and can't be found on $PATH.
+ * Tries, in order: autocd into a directory of that name, a user-defined
+ * handler function (bash's command_not_found_handle or fish's
+ * fish_command_not_found), then a "did you mean" hint. */
+static int handle_not_found(strvec_t *argv, int *handled) {
+    const char *name = argv->items[0];
+    *handled = 1;
+    struct stat st;
+    const char *autocd = config_get("autocd", "yes");
+    if (argv->count == 1 && g_shell_is_interactive && strcmp(autocd, "yes") == 0 &&
+        stat(name, &st) == 0 && S_ISDIR(st.st_mode)) {
+        char *cdargv[] = { (char *)"cd", (char *)name, NULL };
+        return builtin_lookup("cd")(2, cdargv);
+    }
+    const char *handlers[] = { "command_not_found_handle", "fish_command_not_found", NULL };
+    for (int i = 0; handlers[i]; i++) {
+        Node *fn = func_get(handlers[i]);
+        if (!fn) continue;
+        strvec_t hv; sv_init(&hv);
+        sv_push_dup(&hv, handlers[i]);
+        for (size_t k = 0; k < argv->count; k++) sv_push_dup(&hv, argv->items[k]);
+        char **c = sv_to_argv(&hv);
+        int r = exec_call_function(fn, (int)hv.count, c);
+        free(c); sv_free(&hv);
+        return r;
+    }
+    sh_err("command not found: %s\n", name);
+    char *sugg = complete_suggest_command(name);
+    if (sugg) {
+        bool color = isatty(STDERR_FILENO);
+        fprintf(stderr, "       did you mean %s%s%s?\n", color ? "\x1b[1;32m" : "", sugg, color ? "\x1b[0m" : "");
+        free(sugg);
+    }
+    return 127;
+}
+
+void exec_assign(const char *raw) { do_permanent_assignment(raw); }
+
+bool exec_looks_like_assignment(const char *s) {
+    if (!(isalpha((unsigned char)s[0]) || s[0] == '_')) return false;
+    size_t i = 1;
+    while (s[i] && ident_char(s[i])) i++;
+    if (s[i] == '[') { while (s[i] && s[i] != ']') i++; if (s[i] == ']') i++; }
+    if (s[i] == '+' && s[i+1] == '=') return true;
+    return s[i] == '=';
+}
+
+/* declaration builtins receive `name=value` words unexpanded so the
+ * builtin can expand them exactly once (and keep `a=(1 2)` intact) */
+static bool is_decl_builtin(const char *w) {
+    return strcmp(w, "local") == 0 || strcmp(w, "declare") == 0 || strcmp(w, "typeset") == 0 ||
+           strcmp(w, "export") == 0 || strcmp(w, "readonly") == 0;
+}
+
+static void expand_decl_argv(strvec_t *raw, strvec_t *out) {
+    for (size_t i = 0; i < raw->count; i++) {
+        if (i > 0 && exec_looks_like_assignment(raw->items[i])) sv_push_dup(out, raw->items[i]);
+        else expand_word(raw->items[i], out);
+    }
+}
+
+int exec_eval_string(const char *src) {
+    Node *root; char *err = NULL;
+    ParseStatus st = parse_program(src, &root, &err);
+    if (st == PARSE_EMPTY) return 0;
+    if (st == PARSE_INCOMPLETE) { sh_err("eval: unexpected end of input\n"); return 2; }
+    if (st == PARSE_ERROR) { sh_err("eval: %s\n", err); free(err); return 2; }
+    int status = exec_block(root);
+    /* function definitions transferred their bodies; the rest is ours */
+    node_free(root);
+    return status;
+}
+
+int exec_run_argv_nofunc(int argc, char **argv) {
+    if (argc < 1) return 0;
+    BuiltinFn b = builtin_lookup(argv[0]);
+    if (b) return b(argc, argv);
+    strvec_t v; sv_init(&v);
+    for (int i = 0; i < argc; i++) sv_push_dup(&v, argv[i]);
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid < 0) { sv_free(&v); return 1; }
+    if (pid == 0) {
+        reset_child_signals();
+        setpgid(0, 0);
+        char **c = sv_to_argv(&v);
+        execvp(c[0], c);
+        int err = errno;
+        report_exec_failure(c[0], err);
+        flush_exit(err == ENOENT ? 127 : 126);
+    }
+    setpgid(pid, pid);
+    int st = wait_foreground(pid, argv[0]);
+    sv_free(&v);
+    return st;
+}
+
 static int exec_simple_command(Node *n) {
     if (n->argv.count == 0) {
-        /* pure variable/array assignment(s), persists in the shell */
+        /* pure variable/array assignment(s), persists in the shell; or a
+         * bare redirection like `> file` (truncate/create) */
         for (size_t i = 0; i < n->env_assigns.count; i++)
             do_permanent_assignment(n->env_assigns.items[i]);
+        if (n->redirects) {
+            FdSaveList sv = {0};
+            int rc = apply_redirects_ex(n->redirects, &sv);
+            restore_redirects(&sv);
+            procsub_cleanup();
+            return rc == 0 ? 0 : 1;
+        }
         return 0;
     }
 
@@ -364,8 +742,22 @@ static int exec_simple_command(Node *n) {
     }
 
     strvec_t argv; sv_init(&argv);
-    expand_argv_with_aliases(&n->argv, &argv, 0);
-    if (argv.count == 0) { sv_free(&argv); return 0; }
+    if (is_decl_builtin(n->argv.items[0]) && func_get(n->argv.items[0]) == NULL) expand_decl_argv(&n->argv, &argv);
+    else expand_argv_with_aliases(&n->argv, &argv, 0);
+    if (argv.count == 0) {
+        sv_free(&argv);
+        for (size_t i = 0; i < n->env_assigns.count; i++) do_permanent_assignment(n->env_assigns.items[i]);
+        procsub_cleanup();
+        return 0;
+    }
+    if (g_opt_xtrace) xtrace_print(&argv);
+
+    /* `exec` with only redirections: make them permanent in this shell */
+    if (argv.count == 1 && strcmp(argv.items[0], "exec") == 0 && func_get("exec") == NULL) {
+        int rc = apply_redirects(n->redirects);
+        sv_free(&argv);
+        return rc == 0 ? 0 : 1;
+    }
 
     SavedVar *saved; int nsaved;
     apply_env_assigns(&n->env_assigns, &saved, &nsaved);
@@ -373,36 +765,44 @@ static int exec_simple_command(Node *n) {
     int status;
     bool is_ext = func_get(argv.items[0]) == NULL && builtin_lookup(argv.items[0]) == NULL;
 
-    if (n->redirects == NULL && !is_ext) {
-        status = run_in_current_process(&argv, false);
-    } else if (n->redirects == NULL && is_ext) {
+    if (is_ext && !command_exists(argv.items[0])) {
+        int handled = 0;
+        FdSaveList sv = {0};
+        if (apply_redirects_ex(n->redirects, &sv) == 0) status = handle_not_found(&argv, &handled);
+        else status = 1;
+        restore_redirects(&sv);
+    } else if (!is_ext) {
+        /* builtins and functions run inside the shell, so `cd`, `read`,
+         * `export` ... keep their effect even with redirections attached */
+        FdSaveList sv = {0};
+        if (apply_redirects_ex(n->redirects, &sv) == 0) status = run_in_current_process(&argv, false);
+        else status = 1;
+        restore_redirects(&sv);
+    } else if (n->redirects == NULL) {
         status = run_in_current_process(&argv, false);
     } else {
+        fflush(NULL);
         pid_t pid = fork();
         if (pid < 0) {
-            fprintf(stderr, "spire: fork: %s\n", strerror(errno));
+            sh_err("fork: %s\n", strerror(errno));
             status = 1;
         } else if (pid == 0) {
-            signal(SIGINT, SIG_DFL);
-            signal(SIGQUIT, SIG_DFL);
-            signal(SIGTSTP, SIG_DFL);
+            reset_child_signals();
             setpgid(0, 0);
             if (apply_redirects(n->redirects) != 0) flush_exit(1);
             int st = run_in_current_process(&argv, true);
             flush_exit(st);
         } else {
             setpgid(pid, pid);
-            if (g_shell_is_interactive) tcsetpgrp(STDIN_FILENO, pid);
-            int wstatus;
-            waitpid(pid, &wstatus, WUNTRACED);
-            if (g_shell_is_interactive) tcsetpgrp(STDIN_FILENO, g_shell_pgid);
-            if (WIFSTOPPED(wstatus)) { job_add(pid, argv.items[0])->state = JOB_STOPPED; status = 128 + SIGTSTP; }
-            else status = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : 128 + WTERMSIG(wstatus);
+            status = wait_foreground(pid, argv.items[0]);
         }
     }
 
     restore_env_assigns(saved, nsaved);
     sv_free(&argv);
+    procsub_cleanup();
+    set_pipestatus(&status, 1);
+    if (status != 0 && g_traps[TRAP_ERR] && g_cond_depth == 0) run_trap_slot(TRAP_ERR);
     return status;
 }
 
@@ -412,10 +812,11 @@ static int exec_simple_command(Node *n) {
 static int exec_pipeline_stage(Node *n) {
     if (n->type != N_CMD) return exec_stmt(n);
     if (is_arith_cmd(n)) { long v = arith_eval(n->argv.items[1]); return v != 0 ? 0 : 1; }
-    if (apply_redirects(n->redirects) != 0) flush_exit(1);
     strvec_t argv; sv_init(&argv);
     expand_argv_with_aliases(&n->argv, &argv, 0);
+    if (apply_redirects(n->redirects) != 0) flush_exit(1);
     if (argv.count == 0) { sv_free(&argv); return 0; }
+    if (g_opt_xtrace) xtrace_print(&argv);
     SavedVar *saved; int nsaved;
     apply_env_assigns(&n->env_assigns, &saved, &nsaved);
     int st = run_in_current_process(&argv, true);
@@ -424,26 +825,30 @@ static int exec_pipeline_stage(Node *n) {
     return st;
 }
 
+static char *node_to_string(Node *n); /* best-effort, forward declared */
+
 static int exec_pipeline(Node *n) {
     size_t k = n->nchildren;
     if (k == 1) return exec_stmt(n->children[0]);
 
     int (*pipes)[2] = xmalloc(sizeof(int[2]) * (k - 1));
     for (size_t i = 0; i < k - 1; i++) {
-        if (pipe(pipes[i]) != 0) { fprintf(stderr, "spire: pipe: %s\n", strerror(errno)); free(pipes); return 1; }
+        if (pipe(pipes[i]) != 0) { sh_err("pipe: %s\n", strerror(errno)); free(pipes); return 1; }
     }
     pid_t *pids = xmalloc(sizeof(pid_t) * k);
     pid_t pgid = 0;
+    fflush(NULL);
 
     for (size_t i = 0; i < k; i++) {
         pid_t pid = fork();
         if (pid == 0) {
             setpgid(0, pgid); /* first stage: pgid==0 -> becomes its own leader */
-            signal(SIGINT, SIG_DFL);
-            signal(SIGQUIT, SIG_DFL);
-            signal(SIGTSTP, SIG_DFL);
+            reset_child_signals();
             if (i > 0) dup2(pipes[i - 1][0], STDIN_FILENO);
-            if (i < k - 1) dup2(pipes[i][1], STDOUT_FILENO);
+            if (i < k - 1) {
+                dup2(pipes[i][1], STDOUT_FILENO);
+                if (n->children[i]->pipe_stderr) dup2(pipes[i][1], STDERR_FILENO);
+            }
             for (size_t j = 0; j < k - 1; j++) { close(pipes[j][0]); close(pipes[j][1]); }
             int st = exec_pipeline_stage(n->children[i]);
             flush_exit(st);
@@ -453,16 +858,30 @@ static int exec_pipeline(Node *n) {
         pids[i] = pid;
     }
     for (size_t j = 0; j < k - 1; j++) { close(pipes[j][0]); close(pipes[j][1]); }
+    procsub_cleanup();
 
     if (g_shell_is_interactive) tcsetpgrp(STDIN_FILENO, pgid);
-    int status = 0;
+    int *sts = xmalloc(sizeof(int) * k);
+    bool stopped = false;
     for (size_t i = 0; i < k; i++) {
         int st;
-        waitpid(pids[i], &st, 0);
-        if (i == k - 1) status = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+        while (waitpid(pids[i], &st, WUNTRACED) < 0 && errno == EINTR) {}
+        if (WIFSTOPPED(st)) { stopped = true; sts[i] = 128 + WSTOPSIG(st); }
+        else sts[i] = wait_status_code(st);
     }
     if (g_shell_is_interactive) tcsetpgrp(STDIN_FILENO, g_shell_pgid);
+    if (stopped) {
+        char *desc = node_to_string(n);
+        Job *j = job_add(pgid, desc);
+        j->state = JOB_STOPPED;
+        fprintf(stderr, "\n[%d]+  Stopped                 %s\n", j->id, desc);
+        free(desc);
+    }
 
+    int status = sts[k - 1];
+    if (g_opt_pipefail) for (size_t i = 0; i < k; i++) if (sts[i] != 0) status = sts[i];
+    set_pipestatus(sts, k);
+    free(sts);
     free(pipes);
     free(pids);
     jobs_reap(false);
@@ -471,14 +890,14 @@ static int exec_pipeline(Node *n) {
 
 /* ---------- background jobs ---------- */
 
-static char *node_to_string(Node *n); /* best-effort, forward declared */
-
 static int exec_background(Node *n) {
     n->background = false; /* avoid re-triggering once forked */
     pid_t pid = fork();
-    if (pid < 0) { fprintf(stderr, "spire: fork: %s\n", strerror(errno)); n->background = true; return 1; }
+    if (pid < 0) { sh_err("fork: %s\n", strerror(errno)); n->background = true; return 1; }
     if (pid == 0) {
         setpgid(0, 0);
+        reset_child_signals();
+        g_shell_is_interactive = false;
         signal(SIGINT, SIG_IGN);
         signal(SIGQUIT, SIG_IGN);
         signal(SIGTSTP, SIG_IGN);
@@ -488,7 +907,10 @@ static int exec_background(Node *n) {
     setpgid(pid, pid);
     char *desc = node_to_string(n);
     Job *j = job_add(pid, desc);
-    printf("[%d] %d\n", j->id, (int)pid);
+    if (g_shell_is_interactive) fprintf(stderr, "[%d] %d\n", j->id, (int)pid);
+    char pidbuf[16]; snprintf(pidbuf, sizeof(pidbuf), "%d", (int)pid);
+    var_set("!", pidbuf, false);
+    procsub_cleanup();
     free(desc);
     n->background = true;
     return 0;
@@ -496,18 +918,35 @@ static int exec_background(Node *n) {
 
 /* ---------- control flow ---------- */
 
+static bool errexit_applies(Node *n) {
+    if (n->negate) return false;
+    return n->type == N_CMD || n->type == N_PIPELINE || n->type == N_SUBSHELL || n->type == N_TIME;
+}
+
 int exec_block(Node *block) {
     int status = 0;
     for (size_t i = 0; i < block->nchildren; i++) {
         status = exec_stmt(block->children[i]);
         set_status(status);
+        exec_run_pending_traps();
+        if (status != 0 && g_opt_errexit && g_cond_depth == 0 && errexit_applies(block->children[i])) {
+            g_should_exit = true;
+            g_exit_code = status;
+        }
         if (g_should_exit || g_break_flag || g_continue_flag || g_return_flag) return status;
     }
     return status;
 }
 
+static int exec_cond(Node *n) {
+    g_cond_depth++;
+    int st = exec_stmt(n);
+    g_cond_depth--;
+    return st;
+}
+
 static int exec_if(Node *n) {
-    int cond = exec_stmt(n->children[0]);
+    int cond = exec_cond(n->children[0]);
     if (g_should_exit || g_break_flag || g_continue_flag || g_return_flag) return cond;
     if (cond == 0) return exec_block(n->children[1]);
     if (n->nchildren > 2) return exec_block(n->children[2]);
@@ -517,7 +956,7 @@ static int exec_if(Node *n) {
 static int exec_while(Node *n) {
     int status = 0;
     for (;;) {
-        int cond = exec_stmt(n->children[0]);
+        int cond = exec_cond(n->children[0]);
         if (g_should_exit || g_return_flag) return cond;
         if (cond != 0) break;
         status = exec_block(n->children[1]);
@@ -531,7 +970,7 @@ static int exec_while(Node *n) {
 static int exec_until(Node *n) {
     int status = 0;
     for (;;) {
-        int cond = exec_stmt(n->children[0]);
+        int cond = exec_cond(n->children[0]);
         if (g_should_exit || g_return_flag) return cond;
         if (cond == 0) break; /* condition became true -> stop looping */
         status = exec_block(n->children[1]);
@@ -594,44 +1033,34 @@ static int exec_for(Node *n) {
 }
 
 int exec_call_function(Node *body, int argc, char **argv) {
-    if (g_exec_depth > 200) { fprintf(stderr, "spire: function call depth exceeded\n"); return 1; }
+    if (g_exec_depth > 200) { sh_err("function call depth exceeded\n"); return 1; }
     g_exec_depth++;
     var_push_scope();
 
-    /* save positional params to restore after the call (poor man's scoping) */
-    strvec_t save_names, save_vals; sv_init(&save_names); sv_init(&save_vals);
-    char buf[16];
-    for (int i = 0; i <= argc && i < 64; i++) {
-        snprintf(buf, sizeof(buf), "%d", i);
-        const char *old = var_get(buf);
-        sv_push_dup(&save_names, buf);
-        sv_push_dup(&save_vals, old ? old : "\x01\x01NOTSET");
-    }
+    /* save the caller's positional parameters, install the function's */
+    strvec_t saved_pos; sv_init(&saved_pos);
+    for (size_t i = 0; i < exec_positional_count(); i++) sv_push_dup(&saved_pos, exec_positional_get(i));
+    const char *old0 = var_get("0");
+    char *saved0 = old0 ? xstrdup(old0) : NULL;
     var_set("0", argv[0], false);
-    for (int i = 1; i < argc; i++) { snprintf(buf, sizeof(buf), "%d", i); var_set(buf, argv[i], false); }
-    snprintf(buf, sizeof(buf), "%d", argc > 0 ? argc - 1 : 0);
-    var_set("#", buf, false);
+    exec_set_positional(argc - 1, argv + 1);
 
-    dstr_t joined; ds_init(&joined);
-    for (int i = 1; i < argc; i++) { if (i > 1) ds_append_c(&joined, ' '); ds_append(&joined, argv[i]); }
-    var_set("@", joined.data, false);
-    var_set("*", joined.data, false);
-    var_set("argv", joined.data, false);
-    ds_free(&joined);
+    /* fish `function f -a first second`: name the arguments as locals */
+    for (size_t i = 0; i < body->for_words.count; i++) {
+        var_declare_local(body->for_words.items[i]);
+        var_set(body->for_words.items[i], (int)i + 1 < argc ? argv[i + 1] : "", false);
+    }
 
     int status = exec_block(body);
-    if (g_return_flag) g_return_flag = false;
+    if (g_return_flag) { g_return_flag = false; status = g_exit_code; }
     /* break/continue escaping a function body is a script bug; swallow it
      * at the function boundary rather than corrupting the caller's loop */
     g_break_flag = false;
     g_continue_flag = false;
 
-    for (size_t i = 0; i < save_names.count; i++) {
-        if (strcmp(save_vals.items[i], "\x01\x01NOTSET") == 0) var_unset(save_names.items[i]);
-        else var_set(save_names.items[i], save_vals.items[i], false);
-    }
-    sv_free(&save_names);
-    sv_free(&save_vals);
+    exec_set_positional((int)saved_pos.count, saved_pos.items);
+    sv_free(&saved_pos);
+    if (saved0) { var_set("0", saved0, false); free(saved0); }
 
     var_pop_scope();
     g_exec_depth--;
@@ -659,57 +1088,106 @@ static int exec_case(Node *n) {
 
 static int exec_subshell(Node *n) {
     pid_t pid = fork();
-    if (pid < 0) { fprintf(stderr, "spire: fork: %s\n", strerror(errno)); return 1; }
+    if (pid < 0) { sh_err("fork: %s\n", strerror(errno)); return 1; }
     if (pid == 0) {
-        signal(SIGINT, SIG_DFL);
-        signal(SIGQUIT, SIG_DFL);
-        signal(SIGTSTP, SIG_DFL);
+        reset_child_signals();
         setpgid(0, 0);
+        g_shell_is_interactive = false;
         int st = exec_block(n->children[0]);
-        flush_exit(st);
+        exec_run_exit_trap();
+        flush_exit(g_should_exit ? g_exit_code : st);
     }
     setpgid(pid, pid);
-    if (g_shell_is_interactive) tcsetpgrp(STDIN_FILENO, pid);
-    int status;
-    waitpid(pid, &status, WUNTRACED);
-    if (g_shell_is_interactive) tcsetpgrp(STDIN_FILENO, g_shell_pgid);
-    if (WIFSTOPPED(status)) { job_add(pid, "(subshell)")->state = JOB_STOPPED; return 128 + SIGTSTP; }
-    return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+    return wait_foreground(pid, "(subshell)");
+}
+
+static double tv_secs(struct timeval tv) { return (double)tv.tv_sec + (double)tv.tv_usec / 1e6; }
+
+static void print_time_line(const char *label, double secs) {
+    long m = (long)(secs / 60);
+    double s = secs - (double)m * 60;
+    fprintf(stderr, "%s\t%ldm%.3fs\n", label, m, s);
+}
+
+static int exec_time(Node *n) {
+    struct timespec t0, t1;
+    struct rusage c0, c1, s0, s1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    getrusage(RUSAGE_CHILDREN, &c0);
+    getrusage(RUSAGE_SELF, &s0);
+    int st = exec_stmt(n->children[0]);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    getrusage(RUSAGE_CHILDREN, &c1);
+    getrusage(RUSAGE_SELF, &s1);
+    double real = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+    double user = tv_secs(c1.ru_utime) - tv_secs(c0.ru_utime) + tv_secs(s1.ru_utime) - tv_secs(s0.ru_utime);
+    double sys = tv_secs(c1.ru_stime) - tv_secs(c0.ru_stime) + tv_secs(s1.ru_stime) - tv_secs(s0.ru_stime);
+    fflush(stdout);
+    fputc('\n', stderr);
+    print_time_line("real", real);
+    print_time_line("user", user);
+    print_time_line("sys", sys);
+    return st;
 }
 
 /* ---------- dispatcher ---------- */
 
+static int exec_stmt_inner(Node *n);
+
 static int exec_stmt(Node *n) {
     if (!n) return 0;
-    if (n->background && (n->type == N_CMD || n->type == N_PIPELINE || n->type == N_AND ||
-                           n->type == N_OR || n->type == N_SUBSHELL || n->type == N_CASE ||
-                           n->type == N_CONDATOM)) {
-        return exec_background(n);
+    if (n->background && n->type != N_FUNCDEF) return exec_background(n);
+    if (n->redirects && n->type != N_CMD) {
+        /* compound command with trailing redirections: `while ...; done < f` */
+        FdSaveList sv = {0};
+        int st;
+        if (apply_redirects_ex(n->redirects, &sv) == 0) st = exec_stmt_inner(n);
+        else st = 1;
+        restore_redirects(&sv);
+        procsub_cleanup();
+        return st;
     }
+    return exec_stmt_inner(n);
+}
+
+static int negate_if(Node *n, int s) { return n->negate ? (s == 0) : s; }
+
+static int exec_stmt_inner(Node *n) {
     switch (n->type) {
-        case N_CMD: { int s = exec_simple_command(n); return n->negate ? (s == 0) : s; }
-        case N_PIPELINE: { int s = exec_pipeline(n); return n->negate ? (s == 0) : s; }
+        case N_CMD: return negate_if(n, n->negate ? exec_cond_wrapped_cmd(n) : exec_simple_command(n));
+        case N_PIPELINE: return negate_if(n, exec_pipeline(n));
         case N_AND: {
-            int l = exec_stmt(n->children[0]);
+            int l = exec_cond(n->children[0]);
             if (g_should_exit || g_break_flag || g_continue_flag || g_return_flag) return l;
             int s = (l != 0) ? l : exec_stmt(n->children[1]);
-            return n->negate ? (s == 0) : s;
+            return negate_if(n, s);
         }
         case N_OR: {
-            int l = exec_stmt(n->children[0]);
+            int l = exec_cond(n->children[0]);
             if (g_should_exit || g_break_flag || g_continue_flag || g_return_flag) return l;
             int s = (l == 0) ? l : exec_stmt(n->children[1]);
-            return n->negate ? (s == 0) : s;
+            return negate_if(n, s);
         }
-        case N_SEQ: return exec_block(n);
-        case N_BLOCK: return exec_block(n);
+        case N_FISH_AND: {
+            int last = g_exit_code;
+            if (last != 0) return last;
+            return exec_stmt(n->children[0]);
+        }
+        case N_FISH_OR: {
+            int last = g_exit_code;
+            if (last == 0) return 0;
+            return exec_stmt(n->children[0]);
+        }
+        case N_SEQ: return negate_if(n, exec_block(n));
+        case N_BLOCK: return negate_if(n, exec_block(n));
         case N_IF: return exec_if(n);
         case N_WHILE: return exec_while(n);
         case N_UNTIL: return exec_until(n);
         case N_FOR: return exec_for(n);
         case N_CASE: return exec_case(n);
-        case N_SUBSHELL: { int s = exec_subshell(n); return n->negate ? (s == 0) : s; }
+        case N_SUBSHELL: return negate_if(n, exec_subshell(n));
         case N_CONDATOM: return exec_cond_atom(n);
+        case N_TIME: return exec_time(n);
         case N_FUNCDEF: {
             Node *body = n->children[0];
             n->children[0] = NULL; /* transfer ownership to the function table */
@@ -737,8 +1215,8 @@ int exec_source_string(const char *src) {
         return status;
     }
     if (st == PARSE_EMPTY) return 0;
-    if (st == PARSE_INCOMPLETE) { fprintf(stderr, "spire: syntax error: unexpected end of input\n"); return 2; }
-    fprintf(stderr, "spire: %s\n", err);
+    if (st == PARSE_INCOMPLETE) { sh_err("syntax error: unexpected end of input\n"); return 2; }
+    sh_err("%s\n", err);
     free(err);
     return 2;
 }
@@ -789,6 +1267,16 @@ void exec_init(void) {
     char buf[16];
     snprintf(buf, sizeof(buf), "%d", (int)getpid());
     var_set("$", buf, false);
+    snprintf(buf, sizeof(buf), "%d", (int)getppid());
+    var_set("PPID", buf, false);
+    snprintf(buf, sizeof(buf), "%d", (int)getuid());
+    var_set("UID", buf, false);
+    const char *lvl = var_get("SHLVL");
+    snprintf(buf, sizeof(buf), "%d", (lvl ? atoi(lvl) : 0) + 1);
+    var_set("SHLVL", buf, true);
+    char cwd[4096];
+    if (getcwd(cwd, sizeof(cwd))) var_set("PWD", cwd, true);
+    if (!g_pos_init) { sv_init(&g_pos); g_pos_init = true; array_set("argv", &g_pos); }
 }
 
 /* ---------- best-effort node -> string for job listings ---------- */

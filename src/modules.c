@@ -10,7 +10,7 @@ void modules_load_enabled(void) {
         char path[1200];
         snprintf(path, sizeof(path), "%s/%s.spire", config_module_dir(), mods->items[i]);
         if (exec_source_file(path) < 0) {
-            fprintf(stderr, "spire: module '%s' not found (looked for %s)\n", mods->items[i], path);
+            sh_err("module '%s' not found (looked for %s)\n", mods->items[i], path);
         }
     }
 }

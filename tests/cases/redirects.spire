@@ -1,0 +1,31 @@
+# fd redirections, here-docs/strings, redirects on compound commands
+echo out; echo err >&2
+echo "to stderr" 1>&2 2>/dev/null
+{ echo a; echo b; } | wc -l
+x=$(echo hi 2>&1); echo $x
+cat <<< "herestring $x"
+while read line; do echo "line: $line"; done <<EOF2
+one
+two
+EOF2
+cat <<E | tr a-z A-Z
+piped heredoc
+E
+echo after-heredoc
+cat <<A <<B
+first
+A
+second
+B
+cat <<'Q'
+no $expansion here
+Q
+t=/tmp/spire-test-$$
+echo hello > $t; echo world >> $t; cat $t
+read first < $t; echo "read kept: $first"
+exec 3> $t.fd; echo via-fd3 >&3; exec 3>&-; cat $t.fd
+ls /nonexistent-path |& grep -c "No such"
+cat <(echo procsub) | tr a-z A-Z
+for i in 1 2 3; do echo $i; done > $t; wc -l < $t
+if true; then echo in-if; fi 2>/dev/null
+rm -f $t $t.fd

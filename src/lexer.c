@@ -5,6 +5,7 @@ void lexer_init(Lexer *lx, const char *src) {
     lx->src = src;
     lx->pos = 0;
     lx->len = strlen(src);
+    lx->heredoc_resume = 0;
 }
 
 static int peekc(Lexer *lx, size_t off) {
@@ -39,7 +40,8 @@ static char *scan_word(Lexer *lx) {
 
         if (!in_sq && !in_dq && !in_bt && paren_depth == 0) {
             if (isspace((unsigned char)c)) break;
-            if (c == '|' || c == '&' || c == ';' || c == '<' || c == '>' || c == '#' || c == ')') break;
+            if (c == '|' || c == '&' || c == ';' || c == '<' || c == '>' || c == ')') break;
+            if (c == '#' && buf.len == 0) break; /* '#' starts a comment only at a word boundary */
         }
 
         if (c == '\\' && !in_sq) {
@@ -70,75 +72,94 @@ static char *scan_word(Lexer *lx) {
     return result;
 }
 
+static void set_redir(Lexer *lx, Token *out, const char *op, int fd) {
+    lx->pos += strlen(op);
+    out->type = TOK_REDIR;
+    out->text = xstrdup(op);
+    out->fd = fd;
+}
+
+/* Called with lx->pos at a '<' or '>'. Emits the longest matching
+ * redirection operator. */
+static void lex_redir_op(Lexer *lx, Token *out, int fd) {
+    static const char *ops[] = { "<<<", "<<-", "&>>", "<<", "<>", "<&", ">>", ">&", ">|", "&>", "<", ">", NULL };
+    for (int i = 0; ops[i]; i++) {
+        size_t n = strlen(ops[i]);
+        if (strncmp(lx->src + lx->pos, ops[i], n) == 0) {
+            if (strcmp(ops[i], ">|") == 0) { lx->pos += 2; out->type = TOK_REDIR; out->text = xstrdup(">"); out->fd = fd; return; }
+            set_redir(lx, out, ops[i], fd);
+            return;
+        }
+    }
+    set_redir(lx, out, "<", fd);
+}
+
 void lexer_next(Lexer *lx, Token *out) {
     skip_spaces(lx);
+    out->fd = -1;
+    out->text = NULL;
 
-    if (lx->pos >= lx->len) { out->type = TOK_EOF; out->text = NULL; return; }
+    if (lx->pos >= lx->len) { out->type = TOK_EOF; return; }
 
     char c = lx->src[lx->pos];
 
-    if (c == '\n') { lx->pos++; out->type = TOK_NEWLINE; out->text = NULL; return; }
+    if (c == '\n') {
+        lx->pos++;
+        if (lx->heredoc_resume > lx->pos) lx->pos = lx->heredoc_resume;
+        lx->heredoc_resume = 0;
+        out->type = TOK_NEWLINE;
+        return;
+    }
 
     if (c == '#') { skip_comment(lx); lexer_next(lx, out); return; }
 
     /* fd-prefixed redirection: bare digit run immediately followed by > or < */
     if (isdigit((unsigned char)c)) {
-        size_t save = lx->pos;
         size_t p = lx->pos;
         while (p < lx->len && isdigit((unsigned char)lx->src[p])) p++;
-        if (p < lx->len && (lx->src[p] == '>' || lx->src[p] == '<') && p > lx->pos) {
-            char digits[16];
-            size_t dn = p - lx->pos;
-            if (dn > 15) dn = 15;
-            memcpy(digits, lx->src + lx->pos, dn);
-            digits[dn] = '\0';
-            int fd = atoi(digits);
+        if (p < lx->len && (lx->src[p] == '>' || lx->src[p] == '<') && p - lx->pos < 4 &&
+            !(p + 1 < lx->len && lx->src[p + 1] == '(')) {
+            int fd = atoi(lx->src + lx->pos);
             lx->pos = p;
-            if (fd == 2 && lx->src[lx->pos] == '>') {
-                if (peekc(lx, 1) == '>') {
-                    lx->pos += 2; out->type = TOK_DGTERR; out->text = NULL; return;
-                }
-                if (peekc(lx, 1) == '&' && peekc(lx, 2) == '1') {
-                    lx->pos += 3; out->type = TOK_ERR2OUT; out->text = NULL; return;
-                }
-                lx->pos += 1; out->type = TOK_GTERR; out->text = NULL; return;
-            }
-            /* other fds: fall back to treating the digits as a plain word */
-            lx->pos = save;
-        } else {
-            lx->pos = save;
+            lex_redir_op(lx, out, fd);
+            return;
         }
+    }
+
+    /* process substitution <(cmd) / >(cmd) is an ordinary word */
+    if ((c == '<' || c == '>') && peekc(lx, 1) == '(') {
+        dstr_t buf; ds_init(&buf);
+        ds_append_c(&buf, c);
+        lx->pos++;
+        char *rest = scan_word(lx);
+        ds_append(&buf, rest);
+        free(rest);
+        out->type = TOK_WORD;
+        out->text = xstrdup(buf.data);
+        ds_free(&buf);
+        return;
     }
 
     switch (c) {
         case '|':
             lx->pos++;
             if (peekc(lx, 0) == '|') { lx->pos++; out->type = TOK_OR; }
+            else if (peekc(lx, 0) == '&') { lx->pos++; out->type = TOK_PIPE_AMP; }
             else out->type = TOK_PIPE;
-            out->text = NULL; return;
+            return;
         case '&':
+            if (peekc(lx, 1) == '>') { lex_redir_op(lx, out, -1); return; }
             lx->pos++;
             if (peekc(lx, 0) == '&') { lx->pos++; out->type = TOK_AND; }
-            else if (peekc(lx, 0) == '>') { lx->pos++; out->type = TOK_GTAMP; }
             else out->type = TOK_BG;
-            out->text = NULL; return;
+            return;
         case ';':
-            lx->pos++; out->type = TOK_SEMI; out->text = NULL; return;
+            lx->pos++; out->type = TOK_SEMI; return;
         case ')':
-            lx->pos++; out->type = TOK_RPAREN; out->text = NULL; return;
-        case '<':
-            lx->pos++;
-            if (peekc(lx, 0) == '<') {
-                lx->pos++;
-                if (peekc(lx, 0) == '-') { lx->pos++; out->type = TOK_DLT_DASH; }
-                else out->type = TOK_DLT;
-            } else out->type = TOK_LT;
-            out->text = NULL; return;
-        case '>':
-            lx->pos++;
-            if (peekc(lx, 0) == '>') { lx->pos++; out->type = TOK_DGT; }
-            else out->type = TOK_GT;
-            out->text = NULL; return;
+            lx->pos++; out->type = TOK_RPAREN; return;
+        case '<': case '>':
+            lex_redir_op(lx, out, -1);
+            return;
         default: break;
     }
 

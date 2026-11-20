@@ -24,6 +24,7 @@ void node_add_child(Node *n, Node *child) {
 Redirect *redirect_new(RedirType type, const char *target) {
     Redirect *r = xmalloc(sizeof(Redirect));
     r->type = type;
+    r->fd = (type == R_IN || type == R_RDWR || type == R_HEREDOC || type == R_HERESTRING) ? 0 : 1;
     r->target = xstrdup(target);
     r->heredoc_body = NULL;
     r->heredoc_no_expand = false;

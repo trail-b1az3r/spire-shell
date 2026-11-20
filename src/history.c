@@ -1,5 +1,6 @@
 #include "history.h"
 #include <stdio.h>
+#include <unistd.h>
 
 static char **g_entries = NULL;
 static size_t g_count = 0;
@@ -67,7 +68,17 @@ const char *history_get_relative(int back) {
 }
 
 void history_print(void) {
-    for (size_t i = 0; i < g_count; i++) printf("%5zu  %s\n", i + 1, g_entries[i]);
+    bool color = isatty(STDOUT_FILENO);
+    for (size_t i = 0; i < g_count; i++) {
+        if (color) printf("\x1b[90m%5zu\x1b[0m  %s\n", i + 1, g_entries[i]);
+        else printf("%5zu  %s\n", i + 1, g_entries[i]);
+    }
+}
+
+void history_clear(void) {
+    for (size_t i = 0; i < g_count; i++) free(g_entries[i]);
+    g_count = 0;
+    if (g_path[0]) { FILE *f = fopen(g_path, "w"); if (f) fclose(f); }
 }
 
 const char *history_find_prefix_match(const char *prefix) {

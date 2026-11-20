@@ -45,6 +45,10 @@ void sv_free(strvec_t *v);            /* frees items and backing array */
 void sv_clear(strvec_t *v);
 char **sv_to_argv(const strvec_t *v); /* NULL terminated, caller does NOT own strings */
 
+/* prints "spire: " (red when stderr is a terminal) followed by the
+ * formatted message, which should include its own trailing newline */
+void sh_err(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
 /* misc */
 bool str_has_prefix(const char *s, const char *p);
 void trim_ws(char *s);

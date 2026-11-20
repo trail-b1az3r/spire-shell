@@ -1,6 +1,7 @@
 #include "jobs.h"
 #include <sys/wait.h>
 #include <stdio.h>
+#include <unistd.h>
 
 static Job *g_jobs = NULL;
 static int g_next_id = 1;
@@ -69,7 +70,8 @@ void jobs_reap(bool print_notices) {
             Job *next = j->next;
             if (j->state == JOB_DONE) {
                 if (!j->notified) {
-                    fprintf(stderr, "[%d]  Done                    %s\n", j->id, j->cmdline);
+                    if (isatty(STDERR_FILENO)) fprintf(stderr, "\x1b[1m[%d]\x1b[0m  %s%-22s\x1b[0m  %s\n", j->id, j->last_status ? "\x1b[31m" : "\x1b[32m", j->last_status ? "Exit" : "Done", j->cmdline);
+                    else fprintf(stderr, "[%d]  Done                    %s\n", j->id, j->cmdline);
                 }
                 if (prev) prev->next = next; else g_jobs = next;
                 free(j->cmdline);
@@ -83,9 +85,33 @@ void jobs_reap(bool print_notices) {
     }
 }
 
+Job *jobs_head(void) { return g_jobs; }
+
+Job *job_from_spec(const char *spec) {
+    if (!spec || !*spec || strcmp(spec, "%+") == 0 || strcmp(spec, "%%") == 0 || strcmp(spec, "%") == 0) return g_jobs;
+    if (strcmp(spec, "%-") == 0) return g_jobs ? g_jobs->next : NULL;
+    const char *s = spec[0] == '%' ? spec + 1 : spec;
+    if (*s >= '0' && *s <= '9') return job_find(atoi(s));
+    size_t n = strlen(s);
+    for (Job *j = g_jobs; j; j = j->next) if (strncmp(j->cmdline, s, n) == 0) return j;
+    return NULL;
+}
+
 void jobs_print(void) {
-    for (Job *j = g_jobs; j; j = j->next) {
+    bool color = isatty(STDOUT_FILENO);
+    /* oldest first, like bash */
+    int n = 0;
+    for (Job *j = g_jobs; j; j = j->next) n++;
+    Job **arr = xmalloc(sizeof(Job *) * (size_t)(n ? n : 1));
+    int k = n;
+    for (Job *j = g_jobs; j; j = j->next) arr[--k] = j;
+    for (int i = 0; i < n; i++) {
+        Job *j = arr[i];
         const char *state = j->state == JOB_RUNNING ? "Running" : j->state == JOB_STOPPED ? "Stopped" : "Done";
-        printf("[%d]  %-8s  %s\n", j->id, state, j->cmdline);
+        const char *col = j->state == JOB_RUNNING ? "\x1b[32m" : j->state == JOB_STOPPED ? "\x1b[33m" : "\x1b[90m";
+        char mark = (j == g_jobs) ? '+' : (g_jobs && j == g_jobs->next) ? '-' : ' ';
+        if (color) printf("\x1b[1m[%d]\x1b[0m%c %s%-8s\x1b[0m  %s\n", j->id, mark, col, state, j->cmdline);
+        else printf("[%d]%c %-8s  %s\n", j->id, mark, state, j->cmdline);
     }
+    free(arr);
 }

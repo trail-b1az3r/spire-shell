@@ -17,22 +17,27 @@ typedef enum {
     N_BLOCK,    /* children = list of statements (function/if/while/for bodies)  */
     N_CASE,     /* case_subject; children alternate [patterns(N_CMD.argv), body(N_BLOCK)]... */
     N_SUBSHELL, /* children[0] = body, runs in a forked, state-isolated child     */
-    N_CONDATOM  /* one `[[ ... ]]` test atom: argv holds its raw words            */
+    N_CONDATOM, /* one `[[ ... ]]` test atom: argv holds its raw words            */
+    N_FISH_AND, /* fish `and CMD`: children[0] runs only if the last status was 0  */
+    N_FISH_OR,  /* fish `or CMD`: children[0] runs only if the last status was !0  */
+    N_TIME      /* `time PIPELINE`: children[0], prints real/user/sys afterward    */
 } NodeType;
 
 typedef enum {
-    R_IN,           /* <  */
-    R_OUT,          /* >  */
-    R_APPEND,       /* >> */
-    R_ERR,          /* 2> */
-    R_ERR_APPEND,   /* 2>>*/
-    R_ERR_TO_OUT,   /* 2>&1 */
-    R_OUT_ERR,      /* &> both stdout+stderr to target */
-    R_HEREDOC       /* << / <<- */
+    R_IN,             /* fd<  file   (fd defaults to 0)                       */
+    R_OUT,            /* fd>  file   (fd defaults to 1)                       */
+    R_APPEND,         /* fd>> file                                            */
+    R_RDWR,           /* fd<> file                                            */
+    R_DUP,            /* fd>&N / fd<&N, or fd>&- to close                     */
+    R_OUT_ERR,        /* &>  file : stdout+stderr                              */
+    R_OUT_ERR_APPEND, /* &>> file                                             */
+    R_HEREDOC,        /* << / <<-                                             */
+    R_HERESTRING      /* <<< word                                             */
 } RedirType;
 
 typedef struct Redirect {
     RedirType type;
+    int fd;               /* the descriptor being redirected */
     char *target;         /* raw word, expanded at exec time (filename or fd);
                               for R_HEREDOC, the (already dequoted) delimiter */
     char *heredoc_body;    /* R_HEREDOC only: the captured body text, raw */
@@ -55,6 +60,7 @@ typedef struct Node {
 
     bool background;        /* trailing & */
     bool negate;             /* leading ! (pipeline negation, or a [[ ]] atom's !) */
+    bool pipe_stderr;        /* pipeline stage followed by |& : stderr joins the pipe */
 
     /* N_FOR */
     char *for_var;

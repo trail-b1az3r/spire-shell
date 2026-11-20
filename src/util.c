@@ -1,15 +1,16 @@
 #include "common.h"
+#include <stdarg.h>
 #include <ctype.h>
 
 void *xmalloc(size_t n) {
     void *p = malloc(n ? n : 1);
-    if (!p) { fprintf(stderr, "spire: out of memory\n"); exit(127); }
+    if (!p) { sh_err("out of memory\n"); exit(127); }
     return p;
 }
 
 void *xrealloc(void *p, size_t n) {
     void *r = realloc(p, n ? n : 1);
-    if (!r) { fprintf(stderr, "spire: out of memory\n"); exit(127); }
+    if (!r) { sh_err("out of memory\n"); exit(127); }
     return r;
 }
 
@@ -123,4 +124,14 @@ void trim_ws(char *s) {
     size_t newlen = end - start;
     if (start > 0) memmove(s, s + start, newlen);
     s[newlen] = '\0';
+}
+
+void sh_err(const char *fmt, ...) {
+    fflush(stdout);
+    bool color = isatty(STDERR_FILENO);
+    fputs(color ? "\x1b[1;31mspire:\x1b[0m " : "spire: ", stderr);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
 }
