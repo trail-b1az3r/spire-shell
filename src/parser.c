@@ -156,15 +156,25 @@ static Node *parse_and_or_bg(Parser *p) {
 }
 
 static Node *parse_pipeline(Parser *p) {
+    if (word_is(p, "time")) {
+        p_advance(p);
+        Node *t = node_new(N_TIME);
+        if (p->cur.type != TOK_WORD) { node_add_child(t, node_new(N_SEQ)); return t; }
+        Node *inner = parse_pipeline(p);
+        if (!inner) { node_free(t); return NULL; }
+        node_add_child(t, inner);
+        return t;
+    }
     bool neg = false;
-    while (word_is(p, "!")) { neg = !neg; p_advance(p); }
+    while (word_is(p, "!") || word_is(p, "not")) { neg = !neg; p_advance(p); }
 
     Node *first = parse_command(p);
     if (!first) return NULL;
-    if (p->cur.type != TOK_PIPE) { if (neg) first->negate = !first->negate; return first; }
+    if (p->cur.type != TOK_PIPE && p->cur.type != TOK_PIPE_AMP) { if (neg) first->negate = !first->negate; return first; }
     Node *pipe = node_new(N_PIPELINE);
     node_add_child(pipe, first);
-    while (p->cur.type == TOK_PIPE) {
+    while (p->cur.type == TOK_PIPE || p->cur.type == TOK_PIPE_AMP) {
+        if (p->cur.type == TOK_PIPE_AMP) pipe->children[pipe->nchildren - 1]->pipe_stderr = true;
         p_advance(p);
         skip_newlines(p);
         Node *next = parse_command(p);
@@ -175,11 +185,48 @@ static Node *parse_pipeline(Parser *p) {
     return pipe;
 }
 
+static Node *parse_group(Parser *p, const char *closer) {
+    p_advance(p); /* { or begin */
+    const char *stops[] = { closer, NULL };
+    Node *body = parse_block(p, stops);
+    if (!body) return NULL;
+    if (!expect_word(p, closer)) { node_free(body); return NULL; }
+    return body;
+}
+
+static Node *parse_command_inner(Parser *p);
+static Node *parse_trailing_redirects(Parser *p, Node *n);
+
 static Node *parse_command(Parser *p) {
+    if (p->cur.type == TOK_REDIR) return parse_simple_command(p); /* `> file`, `<file cmd` */
     if (p->cur.type != TOK_WORD) {
         set_error(p, "syntax error: unexpected token");
         return NULL;
     }
+    /* fish: `cmd; and other` / `cmd; or other` */
+    if (word_is(p, "and") || word_is(p, "or")) {
+        Token *la = p_peek2(p);
+        if (la->type == TOK_WORD) {
+            NodeType nt = word_is(p, "and") ? N_FISH_AND : N_FISH_OR;
+            p_advance(p);
+            Node *inner = parse_pipeline(p);
+            if (!inner) return NULL;
+            Node *n = node_new(nt);
+            node_add_child(n, inner);
+            return n;
+        }
+    }
+    const char *w = p->cur.text;
+    bool compound = strcmp(w, "if") == 0 || strcmp(w, "while") == 0 || strcmp(w, "until") == 0 ||
+                    strcmp(w, "for") == 0 || strcmp(w, "case") == 0 || strcmp(w, "switch") == 0 ||
+                    strcmp(w, "{") == 0 || strcmp(w, "begin") == 0 || strcmp(w, "[[") == 0 ||
+                    (w[0] == '(' && w[strlen(w) - 1] == ')');
+    Node *n = parse_command_inner(p);
+    if (n && compound) n = parse_trailing_redirects(p, n);
+    return n;
+}
+
+static Node *parse_command_inner(Parser *p) {
     if (strcmp(p->cur.text, "if") == 0) return parse_if(p);
     if (strcmp(p->cur.text, "while") == 0) return parse_while(p);
     if (strcmp(p->cur.text, "until") == 0) return parse_until(p);
@@ -188,6 +235,8 @@ static Node *parse_command(Parser *p) {
     if (strcmp(p->cur.text, "case") == 0) return parse_case(p);
     if (strcmp(p->cur.text, "switch") == 0) return parse_switch(p);
     if (strcmp(p->cur.text, "[[") == 0) return parse_cond(p);
+    if (strcmp(p->cur.text, "{") == 0) return parse_group(p, "}");
+    if (strcmp(p->cur.text, "begin") == 0) return parse_group(p, "end");
     {
         size_t tl = strlen(p->cur.text);
         if (tl >= 5 && str_has_prefix(p->cur.text, "((") && p->cur.text[tl-1] == ')' && p->cur.text[tl-2] == ')') {
@@ -236,18 +285,26 @@ static char *dequote_delim(const char *raw, bool *was_quoted) {
  * hit first (caller should request more input). */
 static void consume_heredoc_body(Parser *p, Redirect *r, bool strip, size_t start_pos) {
     const char *src = p->lx.src;
-    size_t pos = start_pos;
-    while (src[pos] && src[pos] != '\n') pos++;
-    if (src[pos] == '\n') pos++;
+    size_t pos;
+    bool newline_consumed = (p->cur.type == TOK_NEWLINE && !p->la_valid);
+    if (newline_consumed) {
+        pos = p->lx.pos; /* lexer already sits at the start of the body */
+    } else if (p->lx.heredoc_resume > 0) {
+        pos = p->lx.heredoc_resume; /* a second heredoc on the same line */
+    } else {
+        pos = start_pos;
+        while (src[pos] && src[pos] != '\n') pos++;
+        if (src[pos] == '\n') pos++;
+    }
 
     dstr_t body; ds_init(&body);
     size_t delim_len = strlen(r->target);
 
     for (;;) {
+        if (!src[pos]) { p->incomplete = true; break; }
         size_t line_start = pos;
         while (src[pos] && src[pos] != '\n') pos++;
         size_t line_len = pos - line_start;
-        bool at_eof = (src[pos] == '\0');
         if (src[pos] == '\n') pos++;
 
         const char *line = src + line_start;
@@ -262,17 +319,81 @@ static void consume_heredoc_body(Parser *p, Redirect *r, bool strip, size_t star
         if (strip) { while (body_len > 0 && *body_line == '\t') { body_line++; body_len--; } }
         ds_append_n(&body, body_line, body_len);
         ds_append_c(&body, '\n');
-
-        if (at_eof) { p->incomplete = true; break; }
     }
 
     r->heredoc_body = xstrdup(body.data);
     ds_free(&body);
+    if (p->incomplete) return;
 
-    p->lx.pos = pos;
-    token_free(&p->cur);
-    if (p->la_valid) { token_free(&p->la); p->la_valid = false; }
-    if (!p->incomplete) lexer_next(&p->lx, &p->cur);
+    /* The rest of the current line (`| grep x`, `; echo`, ...) still has to
+     * be lexed; the lexer jumps past the body when it reaches the newline.
+     * If that newline was already consumed (as p->cur), jump right now. */
+    if (newline_consumed) {
+        p->lx.pos = pos;
+        p->lx.heredoc_resume = 0;
+    } else {
+        p->lx.heredoc_resume = pos;
+    }
+}
+
+static RedirType redir_type_for(const char *op) {
+    if (strcmp(op, "<") == 0) return R_IN;
+    if (strcmp(op, ">") == 0) return R_OUT;
+    if (strcmp(op, ">>") == 0) return R_APPEND;
+    if (strcmp(op, "<>") == 0) return R_RDWR;
+    if (strcmp(op, ">&") == 0 || strcmp(op, "<&") == 0) return R_DUP;
+    if (strcmp(op, "&>") == 0) return R_OUT_ERR;
+    if (strcmp(op, "&>>") == 0) return R_OUT_ERR_APPEND;
+    if (strcmp(op, "<<<") == 0) return R_HERESTRING;
+    return R_HEREDOC; /* << and <<- */
+}
+
+/* p->cur is a TOK_REDIR. Parses it and its target, appending to *tail.
+ * Returns false on error/incomplete input. */
+static bool parse_redirect(Parser *p, Redirect ***tail) {
+    char *op = xstrdup(p->cur.text);
+    int fd = p->cur.fd;
+    RedirType rt = redir_type_for(op);
+    bool strip = strcmp(op, "<<-") == 0;
+    bool is_input_dup = strcmp(op, "<&") == 0;
+    free(op);
+    p_advance(p);
+    if (p->cur.type != TOK_WORD) {
+        if (p->cur.type == TOK_EOF && rt == R_HEREDOC) { p->incomplete = true; return false; }
+        set_error(p, "syntax error: expected redirection target");
+        return false;
+    }
+    if (rt == R_HEREDOC) {
+        bool quoted;
+        char *delim = dequote_delim(p->cur.text, &quoted);
+        Redirect *r = redirect_new(rt, delim);
+        if (fd >= 0) r->fd = fd;
+        r->heredoc_no_expand = quoted;
+        free(delim);
+        size_t pos_after_delim = p->lx.pos; /* while p->cur is still the delimiter word */
+        p_advance(p);
+        consume_heredoc_body(p, r, strip, pos_after_delim);
+        if (p->incomplete) { free(r->target); free(r->heredoc_body); free(r); return false; }
+        **tail = r; *tail = &r->next;
+        return !p->incomplete;
+    }
+    Redirect *r = redirect_new(rt, p->cur.text);
+    if (fd >= 0) r->fd = fd;
+    else if (rt == R_DUP && is_input_dup) r->fd = 0;
+    **tail = r; *tail = &r->next;
+    p_advance(p);
+    return true;
+}
+
+/* trailing redirections after a compound command: `done < file`, `} > out` */
+static Node *parse_trailing_redirects(Parser *p, Node *n) {
+    if (!n) return NULL;
+    Redirect **tail = &n->redirects;
+    while (*tail) tail = &(*tail)->next;
+    while (p->cur.type == TOK_REDIR) {
+        if (!parse_redirect(p, &tail)) { node_free(n); return NULL; }
+    }
+    return n;
 }
 
 static Node *parse_simple_command(Parser *p) {
@@ -289,46 +410,8 @@ static Node *parse_simple_command(Parser *p) {
             p_advance(p);
             continue;
         }
-        RedirType rt; bool isredir = true;
-        switch (p->cur.type) {
-            case TOK_LT: rt = R_IN; break;
-            case TOK_GT: rt = R_OUT; break;
-            case TOK_DGT: rt = R_APPEND; break;
-            case TOK_GTERR: rt = R_ERR; break;
-            case TOK_DGTERR: rt = R_ERR_APPEND; break;
-            case TOK_ERR2OUT: rt = R_ERR_TO_OUT; break;
-            case TOK_GTAMP: rt = R_OUT_ERR; break;
-            case TOK_DLT: case TOK_DLT_DASH: rt = R_HEREDOC; break;
-            default: isredir = false; rt = R_IN; break;
-        }
-        if (isredir) {
-            bool strip = (p->cur.type == TOK_DLT_DASH);
-            p_advance(p);
-            if (rt == R_ERR_TO_OUT) {
-                Redirect *r = redirect_new(rt, "");
-                *tail = r; tail = &r->next;
-                continue;
-            }
-            if (p->cur.type != TOK_WORD) {
-                set_error(p, "syntax error: expected redirection target");
-                node_free(n); return NULL;
-            }
-            if (rt == R_HEREDOC) {
-                bool quoted;
-                char *delim = dequote_delim(p->cur.text, &quoted);
-                Redirect *r = redirect_new(rt, delim);
-                r->heredoc_no_expand = quoted;
-                free(delim);
-                size_t pos_after_delim = p->lx.pos; /* while p->cur is still the delimiter word */
-                p_advance(p);
-                consume_heredoc_body(p, r, strip, pos_after_delim);
-                *tail = r; tail = &r->next;
-                if (p->incomplete) { node_free(n); return NULL; }
-                continue;
-            }
-            Redirect *r = redirect_new(rt, p->cur.text);
-            *tail = r; tail = &r->next;
-            p_advance(p);
+        if (p->cur.type == TOK_REDIR) {
+            if (!parse_redirect(p, &tail)) { node_free(n); return NULL; }
             continue;
         }
         break;
@@ -449,8 +532,12 @@ static Node *parse_for(Parser *p) {
     Node *n = node_new(N_FOR);
     n->for_var = xstrdup(p->cur.text);
     p_advance(p);
-    if (!word_is(p, "in")) { set_error(p, "syntax error: expected 'in' after for variable"); node_free(n); return NULL; }
-    p_advance(p);
+    if (!word_is(p, "in")) {
+        /* bash: `for x; do ...` iterates the positional parameters */
+        if (p->cur.type == TOK_SEMI || p->cur.type == TOK_NEWLINE || word_is(p, "do")) {
+            sv_push_dup(&n->for_words, "\"$@\"");
+        } else { set_error(p, "syntax error: expected 'in' after for variable"); node_free(n); return NULL; }
+    } else p_advance(p);
     while (p->cur.type == TOK_WORD) { sv_push_dup(&n->for_words, p->cur.text); p_advance(p); }
     skip_separators(p);
     bool bash_style = false;
@@ -471,14 +558,40 @@ static Node *parse_funcdef_kw(Parser *p) {
     size_t nl;
     if (ends_with_parens(name, &nl)) name[nl] = '\0';
     p_advance(p);
+    /* fish options on the same line: -a/--argument-names NAMES..., -d/--description TEXT */
+    strvec_t argnames; sv_init(&argnames);
+    char *desc = NULL;
+    while (p->cur.type == TOK_WORD && strcmp(p->cur.text, "{") != 0) {
+        if (strcmp(p->cur.text, "-a") == 0 || strcmp(p->cur.text, "--argument-names") == 0) {
+            p_advance(p);
+            while (p->cur.type == TOK_WORD && p->cur.text[0] != '-') { sv_push_dup(&argnames, p->cur.text); p_advance(p); }
+            continue;
+        }
+        if ((strcmp(p->cur.text, "-d") == 0 || strcmp(p->cur.text, "--description") == 0)) {
+            p_advance(p);
+            if (p->cur.type == TOK_WORD) {
+                free(desc);
+                const char *t = p->cur.text; size_t tl = strlen(t);
+                if (tl >= 2 && (t[0] == '\'' || t[0] == '"') && t[tl-1] == t[0]) desc = xstrndup(t + 1, tl - 2);
+                else desc = xstrdup(t);
+                p_advance(p);
+            }
+            continue;
+        }
+        p_advance(p); /* other fish options (-w, -S, ...) are accepted and ignored */
+    }
     skip_separators(p);
     bool brace_style = false;
     if (word_is(p, "{")) { p_advance(p); brace_style = true; }
     const char *stop_brace[] = { "}", NULL };
     const char *stop_end[] = { "end", NULL };
     Node *body = parse_block(p, brace_style ? stop_brace : stop_end);
-    if (!body) { free(name); return NULL; }
-    if (!expect_word(p, brace_style ? "}" : "end")) { free(name); node_free(body); return NULL; }
+    if (!body) { free(name); free(desc); sv_free(&argnames); return NULL; }
+    if (!expect_word(p, brace_style ? "}" : "end")) { free(name); free(desc); sv_free(&argnames); node_free(body); return NULL; }
+    /* argument names / description ride along on the body node */
+    for (size_t i = 0; i < argnames.count; i++) sv_push_dup(&body->for_words, argnames.items[i]);
+    sv_free(&argnames);
+    body->case_subject = desc;
     Node *n = node_new(N_FUNCDEF);
     n->func_name = name;
     node_add_child(n, body);
@@ -583,17 +696,52 @@ static Node *parse_switch(Parser *p) {
  * atoms lex as ordinary TOK_AND/TOK_OR, so the same short-circuiting
  * N_AND/N_OR nodes used for shell-level "&&"/"||" are reused here.
  * Parenthesized sub-grouping is not supported (see README limitations). */
+static Node *parse_cond_group(Parser *p, const char *text) {
+    size_t tl = strlen(text);
+    dstr_t src; ds_init(&src);
+    ds_append(&src, "[[ ");
+    ds_append_n(&src, text + 1, tl - 2);
+    ds_append(&src, " ]]");
+    Node *root = NULL; char *err = NULL;
+    ParseStatus st = parse_program(src.data, &root, &err);
+    ds_free(&src);
+    if (st != PARSE_OK || root->nchildren != 1) {
+        set_error(p, "syntax error in [[ ( ... ) ]] group%s%s", err ? ": " : "", err ? err : "");
+        free(err);
+        if (root) node_free(root);
+        return NULL;
+    }
+    Node *inner = root->children[0];
+    root->nchildren = 0;
+    node_free(root);
+    return inner;
+}
+
 static Node *parse_cond_atom(Parser *p) {
     bool neg = false;
     while (word_is(p, "!")) { neg = !neg; p_advance(p); }
+    if (p->cur.type == TOK_WORD && p->cur.text[0] == '(' && p->cur.text[strlen(p->cur.text) - 1] == ')') {
+        Node *g = parse_cond_group(p, p->cur.text);
+        if (!g) return NULL;
+        p_advance(p);
+        if (neg) g->negate = !g->negate;
+        return g;
+    }
     if (p->cur.type != TOK_WORD || strcmp(p->cur.text, "]]") == 0) {
         set_error(p, "syntax error: expected a test expression after '[['");
         return NULL;
     }
     Node *n = node_new(N_CONDATOM);
-    while (p->cur.type == TOK_WORD && strcmp(p->cur.text, "]]") != 0) {
-        sv_push_dup(&n->argv, p->cur.text);
-        p_advance(p);
+    for (;;) {
+        if (p->cur.type == TOK_WORD && strcmp(p->cur.text, "]]") != 0) {
+            sv_push_dup(&n->argv, p->cur.text);
+            p_advance(p);
+        } else if (p->cur.type == TOK_REDIR && p->cur.fd < 0 &&
+                   (strcmp(p->cur.text, "<") == 0 || strcmp(p->cur.text, ">") == 0)) {
+            /* inside [[ ]], < and > are string-ordering operators */
+            sv_push_dup(&n->argv, p->cur.text);
+            p_advance(p);
+        } else break;
     }
     n->negate = neg;
     return n;

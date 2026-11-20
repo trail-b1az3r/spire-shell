@@ -13,7 +13,7 @@ typedef enum {
     AT_AND, AT_OR, AT_BAND, AT_BOR, AT_BXOR, AT_SHL, AT_SHR,
     AT_QUESTION, AT_COLON,
     AT_ASSIGN, AT_PLUSEQ, AT_MINUSEQ, AT_STAREQ, AT_SLASHEQ, AT_PERCENTEQ,
-    AT_INC, AT_DEC, AT_POW
+    AT_INC, AT_DEC, AT_POW, AT_COMMA
 } ArithTokType;
 
 typedef struct {
@@ -95,6 +95,7 @@ static void lex_advance(ArithState *st) {
         case '?': t = AT_QUESTION; break;
         case ':': t = AT_COLON; break;
         case '=': t = AT_ASSIGN; break;
+        case ',': t = AT_COMMA; break;
         default:  t = AT_END; break; /* unknown char: stop gracefully */
     }
     st->cur.type = t;
@@ -112,7 +113,11 @@ static long var_as_long(const char *name) {
     return (end == v) ? 0 : r;
 }
 
+/* >0 while parsing a side of && / || / ?: that must not take effect */
+static int g_noeval = 0;
+
 static void var_store_long(const char *name, long val) {
+    if (g_noeval) return;
     char buf[32];
     snprintf(buf, sizeof(buf), "%ld", val);
     var_set(name, buf, var_is_exported(name));
@@ -188,7 +193,12 @@ static long parse_mul(ArithState *st) {
     long v = parse_unary(st);
     for (;;) {
         if (st->cur.type == AT_STAR) { lex_advance(st); v *= parse_unary(st); }
-        else if (st->cur.type == AT_SLASH) { lex_advance(st); long r = parse_unary(st); v = r ? v / r : 0; }
+        else if (st->cur.type == AT_SLASH) {
+            lex_advance(st);
+            long r = parse_unary(st);
+            if (r == 0 && !g_noeval) { sh_err("division by zero\n"); v = 0; }
+            else v = r ? v / r : 0;
+        }
         else if (st->cur.type == AT_PERCENT) { lex_advance(st); long r = parse_unary(st); v = r ? v % r : 0; }
         else break;
     }
@@ -240,16 +250,43 @@ static long parse_eq(ArithState *st) {
 static long parse_band(ArithState *st) { long v = parse_eq(st); while (st->cur.type == AT_BAND) { lex_advance(st); v = v & parse_eq(st); } return v; }
 static long parse_bxor(ArithState *st) { long v = parse_band(st); while (st->cur.type == AT_BXOR) { lex_advance(st); v = v ^ parse_band(st); } return v; }
 static long parse_bor(ArithState *st)  { long v = parse_bxor(st); while (st->cur.type == AT_BOR) { lex_advance(st); v = v | parse_bxor(st); } return v; }
-static long parse_land(ArithState *st) { long v = parse_bor(st); while (st->cur.type == AT_AND) { lex_advance(st); long r = parse_bor(st); v = v && r; } return v; }
-static long parse_lor(ArithState *st)  { long v = parse_land(st); while (st->cur.type == AT_OR) { lex_advance(st); long r = parse_land(st); v = v || r; } return v; }
+static long parse_land(ArithState *st) {
+    long v = parse_bor(st);
+    while (st->cur.type == AT_AND) {
+        lex_advance(st);
+        if (!v) g_noeval++;
+        long r = parse_bor(st);
+        if (!v) g_noeval--;
+        v = v && r;
+    }
+    return v;
+}
+static long parse_lor(ArithState *st) {
+    long v = parse_land(st);
+    while (st->cur.type == AT_OR) {
+        lex_advance(st);
+        if (v) g_noeval++;
+        long r = parse_land(st);
+        if (v) g_noeval--;
+        v = v || r;
+    }
+    return v;
+}
 
 static long parse_ternary(ArithState *st) {
     long v = parse_lor(st);
     if (st->cur.type == AT_QUESTION) {
         lex_advance(st);
+        if (!v) g_noeval++;
         long a = parse_assignment(st);
+        if (!v) g_noeval--;
         long b = 0;
-        if (st->cur.type == AT_COLON) { lex_advance(st); b = parse_assignment(st); }
+        if (st->cur.type == AT_COLON) {
+            lex_advance(st);
+            if (v) g_noeval++;
+            b = parse_assignment(st);
+            if (v) g_noeval--;
+        }
         return v ? a : b;
     }
     return v;
@@ -287,6 +324,10 @@ long arith_eval(const char *expr) {
     ArithState st;
     st.s = expr ? expr : "";
     st.pos = 0;
+    g_noeval = 0;
     lex_advance(&st);
-    return parse_assignment(&st);
+    long v = parse_assignment(&st);
+    /* comma operator: evaluate left to right, result is the last */
+    while (st.cur.type == AT_COMMA) { lex_advance(&st); v = parse_assignment(&st); }
+    return v;
 }

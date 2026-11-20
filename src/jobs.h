@@ -26,5 +26,8 @@ Job *job_find_by_pgid(pid_t pgid);
 void jobs_reap(bool print_notices);
 void jobs_print(void);
 int jobs_count(void);
+Job *jobs_head(void);          /* newest first */
+/* resolves a job spec: %N, %+, %%, %-, %name, or a bare N; NULL = most recent */
+Job *job_from_spec(const char *spec);
 
 #endif

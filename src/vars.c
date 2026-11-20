@@ -1,4 +1,5 @@
 #include "vars.h"
+#include <time.h>
 
 extern char **environ;
 
@@ -12,6 +13,7 @@ typedef struct VarEntry {
 } VarEntry;
 
 static VarEntry *buckets[VAR_BUCKETS];
+static struct timespec g_start_time;
 
 static unsigned hash_name(const char *s) {
     unsigned h = 5381;
@@ -28,6 +30,8 @@ static VarEntry *find_entry(const char *name) {
 
 void vars_init(void) {
     for (int i = 0; i < VAR_BUCKETS; i++) buckets[i] = NULL;
+    clock_gettime(CLOCK_MONOTONIC, &g_start_time);
+    srandom((unsigned)(time(NULL) ^ getpid()));
     for (char **e = environ; e && *e; e++) {
         char *eq = strchr(*e, '=');
         if (!eq) continue;
@@ -37,7 +41,37 @@ void vars_init(void) {
     }
 }
 
+/* bash's dynamic variables, computed on every read */
+static const char *dynamic_var(const char *name) {
+    static char buf[64];
+    struct timespec now;
+    switch (name[0]) {
+        case 'R':
+            if (strcmp(name, "RANDOM") == 0) { snprintf(buf, sizeof(buf), "%d", (int)(random() % 32768)); return buf; }
+            break;
+        case 'S':
+            if (strcmp(name, "SECONDS") == 0) {
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                snprintf(buf, sizeof(buf), "%ld", (long)(now.tv_sec - g_start_time.tv_sec));
+                return buf;
+            }
+            if (strcmp(name, "SRANDOM") == 0) { snprintf(buf, sizeof(buf), "%u", (unsigned)random() ^ ((unsigned)random() << 16)); return buf; }
+            break;
+        case 'E':
+            if (strcmp(name, "EPOCHSECONDS") == 0) { snprintf(buf, sizeof(buf), "%ld", (long)time(NULL)); return buf; }
+            if (strcmp(name, "EPOCHREALTIME") == 0) {
+                clock_gettime(CLOCK_REALTIME, &now);
+                snprintf(buf, sizeof(buf), "%ld.%06ld", (long)now.tv_sec, now.tv_nsec / 1000);
+                return buf;
+            }
+            break;
+    }
+    return NULL;
+}
+
 const char *var_get(const char *name) {
+    const char *dyn = dynamic_var(name);
+    if (dyn) return dyn;
     VarEntry *e = find_entry(name);
     return e ? e->value : NULL;
 }

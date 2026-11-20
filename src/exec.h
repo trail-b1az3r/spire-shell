@@ -48,4 +48,42 @@ void exec_signal_break(void);
 void exec_signal_continue(void);
 void exec_signal_return(int code);
 
+/* ---- positional parameters ($1.. $# $@ $* and fish's $argv list) ---- */
+void exec_set_positional(int count, char **params); /* params[0] is $1 */
+size_t exec_positional_count(void);
+const char *exec_positional_get(size_t i);          /* 0-based: 0 is $1 */
+
+/* ---- shell options (set -e / -x / -u / -o pipefail) ---- */
+extern bool g_opt_errexit;
+extern bool g_opt_xtrace;
+extern bool g_opt_pipefail;
+extern bool g_opt_nounset;
+
+/* ---- traps: sig 0 = EXIT, TRAP_ERR = ERR, otherwise a signal number ---- */
+#define TRAP_ERR 64
+#define TRAP_SLOTS 65
+void exec_set_trap(int slot, const char *cmd); /* NULL = reset to default, "" = ignore */
+const char *exec_get_trap(int slot);
+void exec_run_pending_traps(void);
+void exec_run_exit_trap(void);
+
+/* ---- process substitution: runs `src` with its stdout (want_read) or
+ * stdin (!want_read) attached to a pipe and returns "/dev/fd/N" for the
+ * other end. The fd is closed after the current command finishes. ---- */
+char *exec_procsub(const char *src, bool want_read);
+
+/* milliseconds the last interactive command took (for %D and $CMD_DURATION) */
+extern long g_last_duration_ms;
+
+/* parse+run `src` inside the current context (no flag resets): `eval` */
+int exec_eval_string(const char *src);
+
+/* runs argv as a builtin or external command, never a function (`command`) */
+int exec_run_argv_nofunc(int argc, char **argv);
+
+/* performs a raw assignment word ("x=1", "a=(1 2)", "a[2]=x", "s+=y"),
+ * expanding its value exactly once */
+void exec_assign(const char *raw);
+bool exec_looks_like_assignment(const char *s);
+
 #endif

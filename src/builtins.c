@@ -22,16 +22,28 @@ static int b_cd(int argc, char **argv) {
     char resolved[4096];
     if (argc < 2) {
         target = var_get("HOME");
-        if (!target) { fprintf(stderr, "spire: cd: HOME not set\n"); return 1; }
+        if (!target) { sh_err("cd: HOME not set\n"); return 1; }
     } else if (strcmp(argv[1], "-") == 0) {
         target = var_get("OLDPWD");
-        if (!target) { fprintf(stderr, "spire: cd: OLDPWD not set\n"); return 1; }
+        if (!target) { sh_err("cd: OLDPWD not set\n"); return 1; }
         printf("%s\n", target);
     } else {
         target = argv[1];
+        /* CDPATH lookup for relative names */
+        const char *cdpath = var_get("CDPATH");
+        static char found[4096];
+        if (cdpath && target[0] != '/' && target[0] != '.' && access(target, F_OK) != 0) {
+            char *copy = xstrdup(cdpath);
+            for (char *save = NULL, *d = strtok_r(copy, ":", &save); d; d = strtok_r(NULL, ":", &save)) {
+                snprintf(found, sizeof(found), "%s/%s", d, target);
+                struct stat st;
+                if (stat(found, &st) == 0 && S_ISDIR(st.st_mode)) { target = found; printf("%s\n", found); break; }
+            }
+            free(copy);
+        }
     }
     char *oldpwd = getcwd(resolved, sizeof(resolved));
-    if (chdir(target) != 0) { fprintf(stderr, "spire: cd: %s: %s\n", target, strerror(errno)); return 1; }
+    if (chdir(target) != 0) { sh_err("cd: %s: %s\n", target, strerror(errno)); return 1; }
     if (oldpwd) var_set("OLDPWD", oldpwd, true);
     char newpwd[4096];
     if (getcwd(newpwd, sizeof(newpwd))) var_set("PWD", newpwd, true);
@@ -42,7 +54,7 @@ static int b_pwd(int argc, char **argv) {
     (void)argc; (void)argv;
     char buf[4096];
     if (getcwd(buf, sizeof(buf))) { printf("%s\n", buf); return 0; }
-    fprintf(stderr, "spire: pwd: %s\n", strerror(errno));
+    sh_err("pwd: %s\n", strerror(errno));
     return 1;
 }
 
@@ -52,31 +64,28 @@ static int b_exit(int argc, char **argv) {
     return g_exit_code;
 }
 
-static int b_export(int argc, char **argv) {
-    if (argc == 1) {
-        strvec_t names; sv_init(&names);
-        vars_dump(&names);
-        for (size_t i = 0; i < names.count; i++)
-            if (var_is_exported(names.items[i]))
-                printf("export %s=%s\n", names.items[i], var_get(names.items[i]));
-        sv_free(&names);
-        return 0;
-    }
-    for (int i = 1; i < argc; i++) {
-        char *eq = strchr(argv[i], '=');
-        if (eq) {
-            *eq = '\0';
-            var_set(argv[i], eq + 1, true);
-            *eq = '=';
-        } else {
-            var_export(argv[i]);
-        }
-    }
-    return 0;
-}
 
 static int b_unset(int argc, char **argv) {
-    for (int i = 1; i < argc; i++) var_unset(argv[i]);
+    bool funcs = false;
+    int i = 1;
+    for (; i < argc && argv[i][0] == '-'; i++) {
+        if (strcmp(argv[i], "-f") == 0) funcs = true;
+        else if (strcmp(argv[i], "-v") == 0) funcs = false;
+        else break;
+    }
+    for (; i < argc; i++) {
+        if (funcs) { func_undefine(argv[i]); continue; }
+        char *br = strchr(argv[i], '[');
+        if (br && array_exists(argv[i]) == false) {
+            /* unset arr[N]: blank that element (no sparse arrays) */
+            char *name = xstrndup(argv[i], (size_t)(br - argv[i]));
+            if (array_exists(name)) array_set_index(name, arith_eval(br + 1), "");
+            free(name);
+            continue;
+        }
+        var_unset(argv[i]);
+        array_unset(argv[i]);
+    }
     return 0;
 }
 
@@ -93,7 +102,7 @@ static int b_alias(int argc, char **argv) {
         if (!eq) {
             const char *v = alias_get(argv[i]);
             if (v) printf("alias %s='%s'\n", argv[i], v);
-            else fprintf(stderr, "spire: alias: %s: not found\n", argv[i]);
+            else sh_err("alias: %s: not found\n", argv[i]);
             continue;
         }
         *eq = '\0';
@@ -112,186 +121,15 @@ static int b_unalias(int argc, char **argv) {
     return 0;
 }
 
-static int b_source(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "spire: source: filename required\n"); return 1; }
-    int st = exec_source_file(argv[1]);
-    if (st < 0) { fprintf(stderr, "spire: source: %s: %s\n", argv[1], strerror(errno)); return 1; }
-    return st;
-}
 
-static int b_echo(int argc, char **argv) {
-    bool nl = true, interpret = false;
-    int i = 1;
-    while (i < argc && argv[i][0] == '-' && argv[i][1]) {
-        if (strcmp(argv[i], "-n") == 0) { nl = false; i++; }
-        else if (strcmp(argv[i], "-e") == 0) { interpret = true; i++; }
-        else if (strcmp(argv[i], "-ne") == 0 || strcmp(argv[i], "-en") == 0) { nl = false; interpret = true; i++; }
-        else break;
-    }
-    for (; i < argc; i++) {
-        if (i > 1 && argv[i-1]) putchar(' ');
-        if (!interpret) { fputs(argv[i], stdout); continue; }
-        for (char *p = argv[i]; *p; p++) {
-            if (*p == '\\' && p[1]) {
-                p++;
-                switch (*p) {
-                    case 'n': putchar('\n'); break;
-                    case 't': putchar('\t'); break;
-                    case '\\': putchar('\\'); break;
-                    default: putchar('\\'); putchar(*p); break;
-                }
-            } else putchar(*p);
-        }
-    }
-    if (nl) putchar('\n');
-    return 0;
-}
 
-static int b_printf(int argc, char **argv) {
-    if (argc < 2) return 0;
-    const char *fmt = argv[1];
-    int argi = 2;
-    const char *p = fmt;
-    while (*p) {
-        if (*p == '\\' && p[1]) {
-            p++;
-            switch (*p) { case 'n': putchar('\n'); break; case 't': putchar('\t'); break; default: putchar(*p); }
-            p++;
-            continue;
-        }
-        if (*p == '%' && p[1]) {
-            p++;
-            if (*p == '%') { putchar('%'); p++; continue; }
-            if (*p == 's') { fputs(argi < argc ? argv[argi++] : "", stdout); p++; continue; }
-            if (*p == 'd' || *p == 'i') { printf("%ld", argi < argc ? strtol(argv[argi++], NULL, 10) : 0); p++; continue; }
-            putchar('%'); continue;
-        }
-        putchar(*p); p++;
-    }
-    return 0;
-}
 
-static int b_type(int argc, char **argv) {
-    if (argc < 2) return 0;
-    int status = 0;
-    for (int i = 1; i < argc; i++) {
-        const char *name = argv[i];
-        if (alias_get(name)) { printf("%s is an alias for '%s'\n", name, alias_get(name)); continue; }
-        if (func_get(name)) { printf("%s is a function\n", name); continue; }
-        if (builtin_exists(name)) { printf("%s is a shell builtin\n", name); continue; }
-        const char *path = var_get("PATH");
-        bool found = false;
-        if (path) {
-            char *pathcopy = xstrdup(path);
-            for (char *dir = strtok(pathcopy, ":"); dir; dir = strtok(NULL, ":")) {
-                char full[4096];
-                snprintf(full, sizeof(full), "%s/%s", dir, name);
-                if (access(full, X_OK) == 0) { printf("%s is %s\n", name, full); found = true; break; }
-            }
-            free(pathcopy);
-        }
-        if (!found) { fprintf(stderr, "spire: type: %s: not found\n", name); status = 1; }
-    }
-    return status;
-}
 
-static int b_jobs(int argc, char **argv) { (void)argc; (void)argv; jobs_print(); return 0; }
 
-static int parse_job_id(const char *s) {
-    if (s[0] == '%') s++;
-    return atoi(s);
-}
 
-static int b_fg(int argc, char **argv) {
-    Job *j = argc > 1 ? job_find(parse_job_id(argv[1])) : NULL;
-    if (!j) { fprintf(stderr, "spire: fg: no such job\n"); return 1; }
-    printf("%s\n", j->cmdline);
-    kill(-j->pgid, SIGCONT);
-    j->state = JOB_RUNNING;
-    if (g_shell_is_interactive) tcsetpgrp(STDIN_FILENO, j->pgid);
-    int status;
-    waitpid(j->pgid, &status, WUNTRACED);
-    if (g_shell_is_interactive) tcsetpgrp(STDIN_FILENO, g_shell_pgid);
-    if (WIFSTOPPED(status)) { j->state = JOB_STOPPED; return 128 + SIGTSTP; }
-    job_remove(j);
-    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
-}
 
-static int b_bg(int argc, char **argv) {
-    Job *j = argc > 1 ? job_find(parse_job_id(argv[1])) : NULL;
-    if (!j) { fprintf(stderr, "spire: bg: no such job\n"); return 1; }
-    kill(-j->pgid, SIGCONT);
-    j->state = JOB_RUNNING;
-    printf("[%d] %s &\n", j->id, j->cmdline);
-    return 0;
-}
 
-static int b_wait(int argc, char **argv) {
-    (void)argv;
-    if (argc > 1) { Job *j = job_find(parse_job_id(argv[1])); if (j) waitpid(j->pgid, NULL, 0); return 0; }
-    int status;
-    while (waitpid(-1, &status, 0) > 0) {}
-    return 0;
-}
 
-static int b_history(int argc, char **argv) { (void)argc; (void)argv; history_print(); return 0; }
-
-static int b_set(int argc, char **argv) {
-    if (argc == 1) {
-        strvec_t names; sv_init(&names);
-        vars_dump(&names);
-        for (size_t i = 0; i < names.count; i++) printf("%s %s\n", names.items[i], var_get(names.items[i]));
-        sv_free(&names);
-        strvec_t anames; sv_init(&anames);
-        arrays_dump(&anames);
-        for (size_t i = 0; i < anames.count; i++) {
-            strvec_t elems; sv_init(&elems);
-            array_get_all(anames.items[i], &elems);
-            printf("%s = (", anames.items[i]);
-            for (size_t k = 0; k < elems.count; k++) printf("%s%s", k ? " " : "", elems.items[k]);
-            printf(")\n");
-            sv_free(&elems);
-        }
-        sv_free(&anames);
-        return 0;
-    }
-    int i = 1;
-    bool exported = false, erase = false;
-    while (i < argc && argv[i][0] == '-') {
-        if (strcmp(argv[i], "-x") == 0) exported = true;
-        else if (strcmp(argv[i], "-e") == 0 || strcmp(argv[i], "--erase") == 0) erase = true;
-        else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "-g") == 0) { /* scope hints: accepted, not distinguished */ }
-        else break;
-        i++;
-    }
-    if (i >= argc) return 0;
-    const char *name = argv[i++];
-    if (erase) { var_unset(name); array_unset(name); return 0; }
-    if (argc - i >= 2) {
-        /* fish semantics: `set name a b c` makes a list, not a joined string */
-        strvec_t elems; sv_init(&elems);
-        for (; i < argc; i++) sv_push_dup(&elems, argv[i]);
-        array_set(name, &elems);
-        var_unset(name);
-        sv_free(&elems);
-        return 0;
-    }
-    dstr_t val; ds_init(&val);
-    for (; i < argc; i++) { if (val.len) ds_append_c(&val, ' '); ds_append(&val, argv[i]); }
-    var_set(name, val.data, exported || var_is_exported(name));
-    array_unset(name);
-    ds_free(&val);
-    return 0;
-}
-
-static int b_functions(int argc, char **argv) {
-    (void)argv;
-    strvec_t names; sv_init(&names);
-    func_list_names(&names);
-    if (argc == 1) { for (size_t i = 0; i < names.count; i++) printf("%s\n", names.items[i]); }
-    sv_free(&names);
-    return 0;
-}
 
 static int b_true(int argc, char **argv) { (void)argc; (void)argv; return 0; }
 static int b_false(int argc, char **argv) { (void)argc; (void)argv; return 1; }
@@ -336,137 +174,6 @@ static int b_break(int argc, char **argv) { (void)argc; (void)argv; exec_signal_
 static int b_continue(int argc, char **argv) { (void)argc; (void)argv; exec_signal_continue(); return 0; }
 static int b_return(int argc, char **argv) { exec_signal_return(argc > 1 ? atoi(argv[1]) : 0); return g_exit_code; }
 
-static int b_read(int argc, char **argv) {
-    const char *prompt = NULL;
-    bool silent = false;
-    int i = 1;
-    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
-        if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) { prompt = argv[++i]; }
-        else if (strcmp(argv[i], "-s") == 0) { silent = true; }
-        else if (strcmp(argv[i], "-r") == 0) { /* raw mode is already the default: no backslash processing */ }
-        else break;
-    }
-    if (prompt) { fputs(prompt, stdout); fflush(stdout); }
-
-    struct termios saved, raw;
-    bool restore_tty = false;
-    if (silent && isatty(STDIN_FILENO)) {
-        if (tcgetattr(STDIN_FILENO, &saved) == 0) {
-            raw = saved;
-            raw.c_lflag &= ~(tcflag_t)ECHO;
-            tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
-            restore_tty = true;
-        }
-    }
-    char line[4096];
-    bool ok = fgets(line, sizeof(line), stdin) != NULL;
-    if (restore_tty) { tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved); if (silent) putchar('\n'); }
-    if (!ok) return 1;
-    size_t n = strlen(line);
-    while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = '\0';
-
-    int nvars = argc - i;
-    if (nvars <= 0) { var_set("REPLY", line, false); return 0; }
-
-    /* bash semantics: split on IFS whitespace across the given names, the
-     * last name absorbing whatever's left (including embedded whitespace). */
-    char *p = line;
-    for (int k = 0; k < nvars; k++) {
-        while (*p == ' ' || *p == '\t') p++;
-        char *start = p;
-        if (k == nvars - 1) {
-            char *end = p + strlen(p);
-            while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
-            char *val = xstrndup(start, (size_t)(end - start));
-            var_set(argv[i + k], val, false);
-            free(val);
-            break;
-        }
-        while (*p && *p != ' ' && *p != '\t') p++;
-        char *val = xstrndup(start, (size_t)(p - start));
-        var_set(argv[i + k], val, false);
-        free(val);
-    }
-    return 0;
-}
-
-/* `test` / `[` supporting the common unary and binary operators, plus the
- * file-comparison and file-type operators bash has beyond the POSIX set.
- * Also reused (via test_eval) for the non-glob, non-regex operators inside
- * `[[ ... ]]` atoms. */
-int test_eval(int argc, char **argv) {
-    int n = argc - 1;
-    char **a = argv + 1;
-    if (n > 0 && strcmp(a[n-1], "]") == 0) n--;
-    if (n == 0) return 1;
-    if (n == 1) return a[0][0] == '\0' ? 1 : 0;
-    if (n == 2 && strcmp(a[0], "!") == 0) return !test_eval(3, (char *[]){"test", a[1], NULL});
-    if (n == 2) {
-        struct stat st;
-        const char *op = a[0], *arg = a[1];
-        if (strcmp(op, "-f") == 0) return (stat(arg, &st) == 0 && S_ISREG(st.st_mode)) ? 0 : 1;
-        if (strcmp(op, "-d") == 0) return (stat(arg, &st) == 0 && S_ISDIR(st.st_mode)) ? 0 : 1;
-        if (strcmp(op, "-e") == 0) return (stat(arg, &st) == 0) ? 0 : 1;
-        if (strcmp(op, "-r") == 0) return access(arg, R_OK) == 0 ? 0 : 1;
-        if (strcmp(op, "-w") == 0) return access(arg, W_OK) == 0 ? 0 : 1;
-        if (strcmp(op, "-x") == 0) return access(arg, X_OK) == 0 ? 0 : 1;
-        if (strcmp(op, "-z") == 0) return arg[0] == '\0' ? 0 : 1;
-        if (strcmp(op, "-n") == 0) return arg[0] != '\0' ? 0 : 1;
-        if (strcmp(op, "-s") == 0) return (stat(arg, &st) == 0 && st.st_size > 0) ? 0 : 1;
-        if (strcmp(op, "-L") == 0 || strcmp(op, "-h") == 0) {
-            struct stat lst;
-            return (lstat(arg, &lst) == 0 && S_ISLNK(lst.st_mode)) ? 0 : 1;
-        }
-        if (strcmp(op, "-b") == 0) return (stat(arg, &st) == 0 && S_ISBLK(st.st_mode)) ? 0 : 1;
-        if (strcmp(op, "-c") == 0) return (stat(arg, &st) == 0 && S_ISCHR(st.st_mode)) ? 0 : 1;
-        if (strcmp(op, "-p") == 0) return (stat(arg, &st) == 0 && S_ISFIFO(st.st_mode)) ? 0 : 1;
-        if (strcmp(op, "-S") == 0) return (stat(arg, &st) == 0 && S_ISSOCK(st.st_mode)) ? 0 : 1;
-    }
-    if (n == 3) {
-        const char *l = a[0], *op = a[1], *r = a[2];
-        if (strcmp(op, "=") == 0 || strcmp(op, "==") == 0) return strcmp(l, r) == 0 ? 0 : 1;
-        if (strcmp(op, "!=") == 0) return strcmp(l, r) != 0 ? 0 : 1;
-        if (strcmp(op, "<") == 0) return strcmp(l, r) < 0 ? 0 : 1;
-        if (strcmp(op, ">") == 0) return strcmp(l, r) > 0 ? 0 : 1;
-        if (strcmp(op, "-nt") == 0 || strcmp(op, "-ot") == 0 || strcmp(op, "-ef") == 0) {
-            struct stat sl, sr;
-            bool lok = stat(l, &sl) == 0, rok = stat(r, &sr) == 0;
-            if (strcmp(op, "-nt") == 0) return (lok && (!rok || sl.st_mtime > sr.st_mtime)) ? 0 : 1;
-            if (strcmp(op, "-ot") == 0) return (rok && (!lok || sl.st_mtime < sr.st_mtime)) ? 0 : 1;
-            return (lok && rok && sl.st_dev == sr.st_dev && sl.st_ino == sr.st_ino) ? 0 : 1;
-        }
-        long li = strtol(l, NULL, 10), ri = strtol(r, NULL, 10);
-        if (strcmp(op, "-eq") == 0) return li == ri ? 0 : 1;
-        if (strcmp(op, "-ne") == 0) return li != ri ? 0 : 1;
-        if (strcmp(op, "-lt") == 0) return li < ri ? 0 : 1;
-        if (strcmp(op, "-le") == 0) return li <= ri ? 0 : 1;
-        if (strcmp(op, "-gt") == 0) return li > ri ? 0 : 1;
-        if (strcmp(op, "-ge") == 0) return li >= ri ? 0 : 1;
-    }
-    return 1;
-}
-
-/* `local [NAME[=value] ...]`: declares NAME as scoped to the enclosing
- * function call, saving whatever it was (or that it was unset) so it's
- * restored the moment that call returns. Only valid inside a function. */
-static int b_local(int argc, char **argv) {
-    if (!var_in_function_scope()) {
-        fprintf(stderr, "spire: local: can only be used inside a function\n");
-        return 1;
-    }
-    for (int i = 1; i < argc; i++) {
-        char *eq = strchr(argv[i], '=');
-        if (eq) {
-            *eq = '\0';
-            var_declare_local(argv[i]);
-            var_set(argv[i], eq + 1, var_is_exported(argv[i]));
-            *eq = '=';
-        } else {
-            var_declare_local(argv[i]);
-        }
-    }
-    return 0;
-}
 
 static int b_module(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: module list | module load NAME\n"); return 1; }
@@ -479,7 +186,7 @@ static int b_module(int argc, char **argv) {
         char path[1200];
         snprintf(path, sizeof(path), "%s/%s.spire", config_module_dir(), argv[2]);
         int st = exec_source_file(path);
-        if (st < 0) { fprintf(stderr, "spire: module: %s: not found\n", argv[2]); return 1; }
+        if (st < 0) { sh_err("module: %s: not found\n", argv[2]); return 1; }
         return st;
     }
     fprintf(stderr, "usage: module list | module load NAME\n");
@@ -489,9 +196,20 @@ static int b_module(int argc, char **argv) {
 static int b_colorscheme(int argc, char **argv) {
     if (argc < 2) {
         printf("current color scheme (see ~/.config/spire/spire.conf to customize):\n");
-        const char *classes[] = {"command","command_invalid","builtin","string","variable","operator",
-                                  "comment","keyword","number","path","array","flag", NULL};
-        for (int i = 0; classes[i]; i++) printf("  %-16s %s\n", classes[i], config_color(classes[i]));
+        const char *classes[] = {"command","command_invalid","builtin","function","string","variable","operator",
+                                  "redirect","comment","keyword","number","path","array","flag","escape",
+                                  "suggestion","description","selection", NULL};
+        bool tty = isatty(STDOUT_FILENO);
+        for (int i = 0; classes[i]; i++) {
+            char *code = ansi_code_for(config_color(classes[i]));
+            if (tty) printf("  %s%-16s\x1b[0m %s\n", code, classes[i], config_color(classes[i]));
+            else printf("  %-16s %s\n", classes[i], config_color(classes[i]));
+            free(code);
+        }
+        return 0;
+    }
+    if (strcmp(argv[1], "list") == 0) {
+        printf("dark\nlight\nmono\nsolarized\nnord\ngruvbox\ndracula\n");
         return 0;
     }
     if (strcmp(argv[1], "dark") == 0) {
@@ -537,54 +255,37 @@ static int b_colorscheme(int argc, char **argv) {
         config_set("color.path", "253"); config_set("color.array", "212");
         config_set("color.number", "215"); config_set("color.flag", "117");
     } else {
-        fprintf(stderr, "spire: colorscheme: unknown scheme '%s' "
+        sh_err("colorscheme: unknown scheme '%s' "
                          "(try dark, light, mono, solarized, nord, gruvbox, dracula)\n", argv[1]);
         return 1;
     }
+    /* classes added later follow the preset's closest relatives */
+    config_set("color.redirect", config_color("operator"));
+    config_set("color.function", config_color("keyword"));
+    config_set("color.builtin", config_color("keyword"));
+    config_set("color.escape", config_color("variable"));
+    config_set("color.description", config_color("comment"));
+    config_set("color.suggestion", config_color("comment"));
     return 0;
 }
 
-static int b_help(int argc, char **argv) {
-    (void)argc; (void)argv;
-    printf(
-        "spire - a shell that blends fish, zsh and bash\n\n"
-        "control flow (fish or bash syntax both work):\n"
-        "  if / else if / else / end        if / elif / else / fi\n"
-        "  while ... end                    while ... do ... done\n"
-        "  until ... end                    until ... do ... done\n"
-        "  for X in ...; ... end            for X in ...; do ... done\n"
-        "  function name ... end            name() { ... }\n"
-        "  [[ -f x && -r x ]]               extended test: == != =~ && || !\n\n"
-        "  {a,b,c}  {1..5}  {01..10..2}     brace expansion\n\n"
-        "builtins: cd pwd exit export unset alias unalias source echo printf\n"
-        "          type jobs fg bg wait history set functions true false\n"
-        "          break continue return read test local let set_color\n"
-        "          module colorscheme help\n\n"
-        "run `module list` to see enabled modules, and edit\n"
-        "~/.config/spire/spire.conf to customize colors and the prompt.\n");
-    return 0;
-}
 
 /* ---------------- table ---------------- */
 
-typedef struct { const char *name; BuiltinFn fn; } BuiltinEntry;
-
 static BuiltinEntry g_table[] = {
-    {"cd", b_cd}, {"pwd", b_pwd}, {"exit", b_exit}, {"export", b_export},
-    {"unset", b_unset}, {"alias", b_alias}, {"unalias", b_unalias},
-    {"source", b_source}, {".", b_source}, {"echo", b_echo}, {"printf", b_printf},
-    {"type", b_type}, {"which", b_type}, {"jobs", b_jobs}, {"fg", b_fg}, {"bg", b_bg},
-    {"wait", b_wait}, {"history", b_history}, {"set", b_set}, {"functions", b_functions},
+    {"cd", b_cd}, {"pwd", b_pwd}, {"exit", b_exit}, {"unset", b_unset},
+    {"alias", b_alias}, {"unalias", b_unalias},
     {"true", b_true}, {"false", b_false}, {"break", b_break}, {"continue", b_continue},
-    {"return", b_return}, {"read", b_read}, {"test", test_eval}, {"[", test_eval},
-    {"let", b_let}, {"set_color", b_set_color}, {"local", b_local},
-    {"module", b_module}, {"colorscheme", b_colorscheme}, {"help", b_help},
+    {"return", b_return}, {"let", b_let}, {"set_color", b_set_color},
+    {"module", b_module}, {"colorscheme", b_colorscheme}, {"complete", complete_builtin},
     {NULL, NULL}
 };
 
-void builtins_init(void) { /* table is static; nothing to do */ }
+void builtins_init(void) { /* tables are static; nothing to do */ }
 
 BuiltinFn builtin_lookup(const char *name) {
+    BuiltinEntry *extra = builtins_extra_table();
+    for (int i = 0; extra[i].name; i++) if (strcmp(extra[i].name, name) == 0) return extra[i].fn;
     for (int i = 0; g_table[i].name; i++) if (strcmp(g_table[i].name, name) == 0) return g_table[i].fn;
     return NULL;
 }
@@ -592,5 +293,7 @@ BuiltinFn builtin_lookup(const char *name) {
 bool builtin_exists(const char *name) { return builtin_lookup(name) != NULL; }
 
 void builtins_list_names(strvec_t *out) {
+    BuiltinEntry *extra = builtins_extra_table();
+    for (int i = 0; extra[i].name; i++) sv_push_dup(out, extra[i].name);
     for (int i = 0; g_table[i].name; i++) sv_push_dup(out, g_table[i].name);
 }

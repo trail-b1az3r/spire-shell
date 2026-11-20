@@ -18,78 +18,117 @@ toy. It is, however, a big project built in one sitting, so see
 
 ## Highlights
 
-- **Both syntaxes, one parser.** Write `if`/`else if`/`end` or
-  `if`/`then`/`elif`/`fi`. Write `for x in a b; do ... done` or
-  `for x in a b; ... end`. `while`/`until`, either style
-  (`until cond; do ... done` or `until cond ... end`). Define functions
-  with `function name ... end` or `name() { ... }`. Mix and match freely,
-  even in the same file. A leading `!` negates any pipeline's exit status.
-- **`[[ ... ]]` extended tests**: `==`/`!=` do glob matching, `=~` matches
-  a POSIX extended regex, `&&`/`||`/`!` combine and negate atoms, plus
-  every `test` operator (`-f -d -e -r -w -x -z -n -s -L -nt -ot -ef ...`).
-  Parenthesized sub-grouping isn't supported — see
-  [Limitations](#limitations).
-- **Brace expansion**: `{a,b,c}`, `{1..10}`, `{10..1..2}`, `{a..e}`, with
-  zero-padding preserved (`{01..10}`) and nesting (`{a,b}{1,2}`).
-  Respects quoting, like real brace expansion should.
-- **Math**: `$((expr))` and standalone `(( expr ))` support the full
-  C-style operator set — `+ - * / % ** << >> < <= > >= == != & | ^ && ||
-  ?: = += -= *= /= %= ++ --` — plus a `let` builtin.
-- **Arrays**: bash-style `arr=(a b c)`, `arr+=(d)`, `arr[2]=x`,
-  `${arr[i]}` (negative indices count from the end), `${arr[@]}`,
-  `${arr[*]}`, `${#arr[@]}`, and fish-style `set arr a b c`.
-- **`local` variables**: dynamically scoped exactly like bash — `local
-  name[=value]` inside a function saves whatever the name held (or that
-  it was unset) and restores it the moment that call returns, so
-  recursive functions don't stomp on each other's variables.
-- **case/esac and switch/case/end**, both wired to the same matcher
-  (glob-style patterns via `fnmatch`, `|` to combine patterns in the
-  bash form).
-- **Subshells** `(cmds)` — run in an isolated forked child, so `cd` and
-  variable changes inside don't leak out.
-- **Here-docs**: `<<EOF`, `<<-EOF` (strips leading tabs), and
-  `<<'EOF'`/`<<"EOF"` for a literal, non-expanding body.
-- **Fish-style autosuggestions**: as you type, the rest of the most
-  recent matching history entry appears inline in a dim color; accept it
-  with → or End, or just keep typing to ignore it.
-- **Live syntax highlighting**, computed and redrawn on every keystroke,
-  with colors defined in a config file, not hardcoded — commands,
-  invalid commands, strings, variables, operators, comments, keywords,
-  numbers, filesystem paths, option flags/test operators, and array
-  subscripts each get their own configurable color, plus a `set_color`
-  builtin (à la fish) for building custom-colored prompts and output,
-  and seven built-in `colorscheme` presets (`dark`, `light`, `mono`,
-  `solarized`, `nord`, `gruvbox`, `dracula`).
-- **A real line editor**, built on raw termios, not GNU readline: arrow
-  keys, Ctrl-A/E/U/K/W/T (transpose), Alt-F/B (word motion), Alt-D/
-  Alt-Backspace (word delete), Ctrl-R reverse incremental history search,
-  history browsing, Ctrl-C to cancel a line without killing the shell,
-  Ctrl-L to clear the screen.
-- **Context-aware Tab completion** for commands, files, and
-  `$variables`: directory-only completion after `cd`/`pushd`/`rmdir`,
-  `~/...` completion against your real home directory without spelling
-  it out in the edited line, repeated Tab cycles through a colorized
-  candidate menu (like zsh's menu-complete) instead of just listing them,
-  and a fuzzy (subsequence) fallback when nothing matches the literal
-  prefix — `cfgfile<Tab>` still finds `my_config_file.txt`.
-- **Pipes, redirection, job control**: `|`, `&&`, `||`, `;`, `&`,
-  `>`, `>>`, `<`, `2>`, `2>>`, `2>&1`, `&>`, plus `jobs`/`fg`/`bg`/`wait`.
-  Foreground jobs get real terminal control via `tcsetpgrp`.
-  Background jobs report `Done` the next time you get a prompt.
-- **Variable expansion**: `$VAR`, `${VAR}`, `${VAR:-default}`,
-  `${VAR:+alt}`, `${VAR:=default}`, `${#VAR}`, `$?`, `$$`, `$0`, `$1..$9`,
-  `$#`, `$@`/`$*`, and fish's `$argv`.
-- **Command substitution**, three ways: `$(cmd)`, `` `cmd` ``, and fish's
-  bare `(cmd)`.
-- **Aliases, functions, globbing, quoting** (`'literal'`, `"$expanded"`,
-  `\escapes`), `~` expansion.
-- **A module system**: drop a `.spire` file in `~/.config/spire/modules/`,
-  list it in `modules = ...` in the config, and it's sourced at startup.
-  Two starter modules ship in the box (`aliases`, `git`).
-- **~30 builtins**: `cd pwd exit export unset alias unalias source echo
-  printf type which jobs fg bg wait history set functions true false
-  break continue return read test local let set_color module colorscheme
-  help`.
+### Syntax: fish and bash, in one parser
+
+- **Both control-flow styles.** `if`/`else if`/`end` or `if`/`then`/`elif`/`fi`;
+  `for`/`while`/`until` with `end` or `do ... done`; `switch`/`case`/`end` or
+  `case`/`esac`; `function name ... end` or `name() { }`. Mix them freely.
+- **fish extras**: `begin ... end` blocks, `cmd; and other`, `cmd; or other`,
+  `not cmd`, `function f -a first second -d "description"` (named arguments),
+  `$status`, list variables with 1-based indexing (`$list[1]`, `$list[-1]`,
+  `$list[2..3]`), `(cmd)` command substitution, `**` recursive globs
+  (`**/*.c`, `**.md`), and the `string`, `math`, `count`, `contains`,
+  `random`, `status`, `abbr` and `set -l/-g/-x/-e/-q/-a/-p` builtins.
+- **bash extras**: `{ cmd; cmd; }` groups, `( subshells )`, `!` negation,
+  `time pipeline`, `[[ ]]` with `==` globs, `=~` regexes, `<`/`>`,
+  `( grouping )`, `&&`/`||`/`!`; `(( arithmetic ))` with short-circuiting
+  `&&`/`||`/`?:` and the `,` operator; `for x; do` over `"$@"`;
+  `local`/`declare`/`typeset`/`readonly`/`export` (including `local a=(1 2)`).
+- **Full parameter expansion**: `${v:-d}` `${v-d}` `${v:=d}` `${v:+a}`
+  `${v:?msg}` `${#v}` `${v#pat}` `${v##pat}` `${v%pat}` `${v%%pat}`
+  `${v/pat/rep}` `${v//pat/rep}` `${v/#pat/rep}` `${v/%pat/rep}`
+  `${v:offset:length}` `${v^}` `${v^^}` `${v,}` `${v,,}` `${v@Q}` `${!ref}`
+  `${!arr[@]}` `${!prefix*}`, nested (`${a:-${b:-c}}`), and the same
+  operators applied to whole arrays (`${arr[@]^^}`, `${arr[@]:1:2}`, `${@:2}`).
+- **Quoting & expansion**: `'...'`, `"..."`, `$'\t\x41\e'` ANSI-C strings,
+  `"$@"` keeps each argument separate, brace expansion (`{a,b}`, `{01..10..2}`),
+  `$(cmd)`, `` `cmd` ``, `(cmd)`, process substitution `<(cmd)` / `>(cmd)`,
+  `~` / `~user`, and dynamic variables `$RANDOM $SECONDS $EPOCHSECONDS
+  $EPOCHREALTIME $PPID $UID $SHLVL $!`, plus `PIPESTATUS`/`$pipestatus`.
+- **Redirection**: `>` `>>` `<` `<>` with any fd (`3> file`, `2>> log`),
+  duplication and closing (`>&2`, `2>&1`, `3>&-`, `<&3`), `&>` `&>>`,
+  `<<EOF` `<<-EOF` `<<'EOF'`, here-strings `<<<`, `|&`, and redirections on
+  compound commands (`while read l; do ...; done < file`, `{ ...; } > out`).
+  Builtins keep their effect when redirected (`read x < file` works).
+- **Shell options & traps**: `set -e`, `set -x` (colored trace), `set -u`,
+  `set -o pipefail`, `set --`; `trap 'cmd' EXIT ERR INT TERM ...`.
+- **History expansion** at the prompt: `!!`, `!$`, `!^`, `!*`, `!n`, `!-n`,
+  `!prefix`, `!!:$`, and `^old^new`. A leading space keeps a command out of
+  history.
+
+### Interactive: completion, editing, color
+
+- **Context-aware Tab completion** with a fish/zsh-style menu: candidates
+  are laid out in a grid with **descriptions**, colored by kind (files use
+  your `LS_COLORS`), and repeated Tab / Shift-Tab / arrow keys move a
+  highlighted selection (Enter accepts, Ctrl-G cancels). Filenames with
+  spaces are escaped (or completed inside the quote you opened).
+  It knows about:
+  - commands (builtins, functions with their descriptions, aliases,
+    abbreviations, keywords, `$PATH`), `$variables` / `${vars}` (with their
+    values), `~users`, directories only after `cd`/`pushd`/`mkdir` (and
+    `$CDPATH`), files after redirections and `--opt=` / `VAR=`
+  - **options parsed from `--help`** (`ls --col<Tab>` → `--color`), cached
+    and limited to native binaries so scripts are never run
+  - `git` subcommands, branches, tags, remotes, changed files and your git
+    aliases; `make` targets; `ssh`/`scp` hosts from `~/.ssh/config`,
+    `known_hosts` and `/etc/hosts`; `kill` signals, jobs and processes;
+    `npm`/`yarn`/`pnpm run` scripts from `package.json`; `man`/`which`/`type`;
+    `export`/`unset`/`set`; `fg`/`bg`; `trap`; `module`; `colorscheme`; …
+  - **your own completions** with a `complete` builtin that speaks both
+    dialects:
+    ```sh
+    complete -c deploy -f -a 'staging production' -d 'environment'   # fish
+    complete -c deploy -l force -d 'skip safety checks'
+    complete -W "start stop status" svc                              # bash
+    _mytool() { COMPREPLY=(alpha beta gamma); }; complete -F _mytool mytool
+    ```
+  - and a case-insensitive, then fuzzy (subsequence) fallback when nothing
+    matches literally: `cfgfile<Tab>` finds `my_config_file.txt`.
+- **A wrap- and Unicode-aware line editor** (no readline): long lines wrap
+  correctly, wide characters and emoji count as two columns, plus
+  fish-style autosuggestions from history (→ / End / Ctrl-E accepts all,
+  Alt-→ / Alt-F accepts one word), Up/Down **prefix search** through history,
+  Ctrl-R incremental search with the match highlighted, undo (Ctrl-Z /
+  Ctrl-_), a kill ring (Ctrl-U/K/W, Alt-D, Alt-Backspace, Ctrl-Y), Alt-.
+  (insert the last argument of earlier commands), Alt-U/L/C (upper/lower/
+  capitalize word), Alt-T (transpose words), Alt-S (toggle `sudo`),
+  Ctrl-X Ctrl-E / Alt-E (edit the line in `$EDITOR`).
+- **Abbreviations** (`abbr -a gco git checkout`) expand in place when you
+  press space or Enter, like fish.
+- **Live syntax highlighting** with configurable colors for commands,
+  invalid commands, builtins, functions, keywords, strings, variables,
+  escapes, operators, redirections, comments, numbers, flags, and paths —
+  arguments naming **existing files are underlined**, redirection targets are
+  recognized, and `$(...)` contents are highlighted recursively.
+- **A richer prompt**: zsh-style escapes including exit status (`%?`, `%E`),
+  conditionals (`%(?.green.red)`), git branch with dirty marker (`%G`),
+  command duration for slow commands (`%c`), jobs (`%J`), time (`%T`,
+  `%D{fmt}`), virtualenv (`%v`), background colors (`%K{}`), bold and
+  underline — plus a **right prompt** (`rprompt`). The default prompt turns
+  red after a failed command and shows `✘ status`, durations and job counts on
+  the right. Output that didn't end with a newline is marked with a dim `⏎`.
+- **Helpful errors**: `command not found` in red with a **did-you-mean**
+  suggestion (`gti` → `git`), `autocd` (type a directory name to `cd` into
+  it), and `command_not_found_handle` / `fish_command_not_found` hooks.
+- **Colors everywhere**: colored `jobs`, `history`, `type`, `set`, `abbr`,
+  `functions`, `help`, `set -x` traces, job notifications, and an `aliases`
+  module that turns on color for `ls`, `grep`, `diff` and `ip`. Colors accept
+  names, 256-color numbers, `#rrggbb` truecolor and `bold-`/`underline-`/
+  `italic-`/`dim-`/`reverse` modifiers; `colorscheme` switches between seven
+  presets.
+
+### Builtins
+
+`cd pwd exit export unset alias unalias source . echo printf read test [
+type which command builtin eval exec : shift getopts set declare typeset
+readonly local let jobs fg bg wait kill disown trap umask dirs pushd popd
+history functions true false break continue return string math count
+contains random status abbr complete set_color module colorscheme help`
+
+`printf` supports widths, precision, `%d %i %u %o %x %X %f %e %g %c %s %b %q`,
+`*` widths and `-v var`; `read` supports `-p -s -r -n -d -t -a`; `test`/`[`
+supports `! ( ) -a -o` and every bash file operator.
 
 ## Building & installing
 
@@ -123,7 +162,7 @@ anything.
 ## Using it
 
 ```sh
-spire                    # interactive shell
+spire                    # interactive shell (also: spire -i, spire -l)
 spire -c 'echo hi'       # run a one-liner and exit
 spire script.spire a b   # run a script, with $1=a $2=b
 ```
@@ -180,36 +219,53 @@ end
 
 ## Configuration
 
-`~/.config/spire/spire.conf`, plain `key = value`:
+`~/.config/spire/spire.conf`, plain `key = value` (see `config/spire.conf` for
+every key with comments):
 
 ```sh
-prompt = "%F{cyan}%n%f@%F{cyan}%m%f %F{yellow}%~%f %F{brightblack}%g%f %F{green}spire❯%f "
+prompt  = "%F{cyan}%n%f@%F{cyan}%m%f %F{yellow}%~%f %F{brightblack}%G%f%(?.%F{green}.%F{red})▲❯%f "
+rprompt = "%(?..%F{red}✘ %?%f )%F{yellow}%c%f%F{brightblack}%J%f"
 
 color.command         = green
 color.command_invalid = red
-color.builtin         = blue
-color.string          = yellow
-color.variable        = cyan
-color.operator        = magenta
-color.comment         = brightblack
-color.keyword         = blue
-color.number          = magenta
-color.flag            = brightcyan
+color.function        = brightblue
+color.redirect        = brightmagenta
+color.description     = brightblack     # completion menu descriptions
+color.selection       = reverse         # selected completion
+# ... and builtin string variable operator comment keyword number path
+#     array flag escape suggestion text
 
+autocd = yes
+autosuggest = yes
+highlight.valid_paths = yes
+complete.parse_help = yes
+prompt.duration_threshold = 2000        # ms before %c shows a duration
 history.size = 5000
 modules = aliases, git
 ```
 
-Prompt escapes: `%n` user, `%m` host, `%~` cwd (with `$HOME` shortened to
-`~`), `%d` full cwd, `%g` git branch, `%#` `#`/`$` for root/non-root,
-`%F{color}...%f` a colored span, `%%` a literal `%`.
+Commands to run at startup — aliases, abbreviations, functions, `complete`
+rules, `set -o` options — go in `~/.config/spire/config.spire` (or
+`~/.spirerc`), which interactive shells source after loading modules.
+
+Prompt escapes: `%n` user, `%m`/`%M` short/full host, `%~` cwd with `~`,
+`%/` full cwd, `%.` last cwd component, `%g` git branch, `%G` `(branch*)`
+with a dirty marker, `%?` last exit status, `%E` `✘ N` only after a failure,
+`%j`/`%J` job count (always / only when nonzero), `%c` duration of the last
+command if it was slow, `%T` `%*` `%t` time, `%D{strftime}`, `%v`
+virtualenv, `%h` history number, `%#` `#`/`$`, `%F{color}…%f` and
+`%K{color}…%k` foreground/background, `%B…%b` bold, `%U…%u` underline,
+`%(?.yes.no)` conditionals (`?` success, `j` jobs, `#` root, `N` status N),
+`%%` a literal `%`.
 
 Color values: `black red green yellow blue magenta cyan white default`,
-their `bright*` variants, `bold-<name>`, or a raw 256-color number.
+their `bright*` variants, `gray orange purple`, a 256-color number,
+`#rrggbb`, the attributes `bold underline italic dim reverse`, and
+modifier prefixes such as `bold-red` or `underline-cyan`.
 
 There's also a `colorscheme` builtin with seven built-in presets
-(`colorscheme dark|light|mono|solarized|nord|gruvbox|dracula`) if you'd
-rather not hand-pick every color.
+(`colorscheme dark|light|mono|solarized|nord|gruvbox|dracula`; plain
+`colorscheme` shows the current colors as a swatch).
 
 ## Writing a module
 
@@ -244,52 +300,54 @@ src/            all shell source (C11, no external dependencies)
   history.c/h     command history (in-memory + append-only file)
   lineedit.c/h    raw-terminal line editor (the "not-readline" part)
   highlight.c/h   live syntax highlighter used by the line editor
-  complete.c/h    tab completion (commands, files, variables)
-  colors.c/h      ANSI color name/code resolution
+  builtins_extra.c  set/declare/printf/read/test/trap/getopts/string/math/abbr/...
+  complete.c/h    tab completion engine, `complete` rules, --help parsing
+  colors.c/h      color specs, LS_COLORS, terminal display width
   config.c/h      spire.conf loading
   prompt.c/h      prompt template rendering (%n %m %~ %F{}... etc)
   modules.c/h     module loader
   main.c          entry point, argument handling, REPL loop
 config/
   spire.conf        starter config, copied to ~/.config/spire on install
-  modules/          starter modules (aliases, git)
+  modules/          starter modules (aliases, git, fish)
+tests/
+  run.sh            regression suite: `make test` (`tests/run.sh --update` to regenerate)
+  cases/            NAME.spire scripts and their NAME.expected output
 install.sh, uninstall.sh, Makefile
 ```
+
+## Testing
+
+```sh
+make test
+```
+
+runs every script in `tests/cases/` and diffs its output against the
+matching `.expected` file.
 
 ## Limitations
 
 This was built to be genuinely useful, not to pass a POSIX conformance
 suite. Known gaps, so nothing surprises you:
 
-- No process substitution (`<(cmd)` / `>(cmd)`).
-- No true nested arrays or associative arrays (maps) — only flat,
-  integer-indexed arrays.
-- `[[ ... ]]` doesn't support parenthesized sub-grouping (`( expr )`
-  inside the brackets) or unquoted `<`/`>` string-ordering operators —
-  use `&&`/`||` to combine tests instead, and quote comparisons.
-- No `select` loops or `trap`.
-- UTF-8 in the line editor is passed through but cursor-column math
-  assumes one byte = one column, so multi-byte characters can throw off
-  cursor positioning during editing (the content itself is fine).
-- Very long command lines that wrap past the terminal width can confuse
-  the line editor's redraw; it isn't multi-row aware.
+- No associative arrays (maps) and no sparse arrays — only flat,
+  integer-indexed arrays (`unset arr[2]` blanks the element).
+- No `select` loops, `coproc`, or `case` fall-through (`;&`, `;;&`).
+- `readonly`, `declare -i`/`-r`/`-l`/`-u` are accepted but don't enforce
+  their attribute.
+- The line editor is single-line: multi-line commands are entered one line
+  at a time with a continuation prompt, and bracketed paste isn't used
+  (pasting several lines runs them one by one, like bash).
 - Aliases are argument-prefix macros (`alias ll='ls -la'`), not full
-  re-parsed command lines — an alias can't itself contain a pipe or `&&`.
+  re-parsed command lines — an alias can't itself contain a pipe or `&&`
+  (use a function or an `abbr` for that).
 - Word splitting/globbing is a close, pragmatic approximation of
   POSIX rules, not a byte-for-byte match to bash.
-- `export`/`cd`/other state-changing builtins run with an I/O redirection
-  attached (rare) execute in a forked child and so won't affect the
-  parent shell's state — matches most real shells' subshell semantics
-  closely but is a simplification worth knowing about.
-- Job control works (`jobs`/`fg`/`bg`, real `tcsetpgrp` terminal-control
-  handoff) but stopped-job/`SIGTSTP` handling is basic compared to a
-  mature shell.
-- Arithmetic (`$(( ))`) doesn't short-circuit `&&`/`||` (both sides
-  always evaluate), which only matters if a side has a side effect like
-  `i++`.
-- Heredoc body capture assumes no pending two-token lookahead at the
-  point it's parsed; this holds for ordinary use but is a known edge
-  case in deeply unusual constructs.
+- `set -e` follows the common cases (simple commands, pipelines, subshells
+  outside conditions), not every bash corner case.
+- Job control works (`jobs`/`fg`/`bg`/`kill %n`/`disown`, real `tcsetpgrp`
+  terminal handoff, stopped-job reporting) but is simpler than a mature
+  shell's.
 
 Patches welcome in spirit, even though this is a from-scratch personal
 project rather than a maintained package — read the source, it's meant

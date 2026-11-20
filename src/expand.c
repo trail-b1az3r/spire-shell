@@ -5,6 +5,10 @@
 #include "arrays.h"
 #include <ctype.h>
 #include <glob.h>
+#include <fnmatch.h>
+#include <dirent.h>
+#include <pwd.h>
+#include <sys/stat.h>
 
 static char *cmdsubst_run(const char *src) {
     char *out = NULL;
@@ -45,12 +49,23 @@ static char *scan_balanced_parens(const char **pp) {
     return res;
 }
 
-/* *pp points at '{'; non-nested content up to matching '}'. */
+/* *pp points at '{'; content up to the matching '}' (nesting- and
+ * quote-aware, so `${x:-${y:-z}}` and `${x/"}"/a}` work). */
 static char *scan_balanced_braces(const char **pp) {
     const char *p = *pp;
     p++;
     const char *start = p;
-    while (*p && *p != '}') p++;
+    int depth = 1;
+    bool insq = false, indq = false;
+    while (*p) {
+        char c = *p;
+        if (c == '\\' && !insq && p[1]) { p += 2; continue; }
+        if (c == '\'' && !indq) insq = !insq;
+        else if (c == '"' && !insq) indq = !indq;
+        else if (!insq && c == '{' && p > start && p[-1] == '$') depth++;
+        else if (!insq && !indq && c == '}') { depth--; if (depth == 0) break; }
+        p++;
+    }
     char *res = xstrndup(start, (size_t)(p - start));
     if (*p == '}') p++;
     *pp = p;
@@ -74,105 +89,385 @@ static char *scan_backtick(const char **pp) {
     return res;
 }
 
-static char *resolve_brace_expr(char *inner) {
-    char *result;
-    if (inner[0] == '#' && inner[1]) {
-        const char *v = var_get(inner + 1);
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%zu", v ? strlen(v) : 0);
-        result = xstrdup(buf);
-        free(inner);
-        return result;
-    }
-    char *colon = strchr(inner, ':');
-    if (colon && colon[1]) {
-        *colon = '\0';
-        char op = colon[1];
-        char *word = colon + 2;
-        const char *v = var_get(inner);
-        bool empty = (!v || v[0] == '\0');
-        if (op == '-') result = xstrdup(empty ? word : v);
-        else if (op == '+') result = xstrdup(empty ? "" : word);
-        else if (op == '=') {
-            if (empty) { var_set(inner, word, var_is_exported(inner)); result = xstrdup(word); }
-            else result = xstrdup(v);
-        } else {
-            result = xstrdup(v ? v : "");
-        }
-        free(inner);
-        return result;
-    }
-    const char *v = var_get(inner);
-    result = xstrdup(v ? v : "");
-    free(inner);
-    return result;
+/* ---------------- ${...} parameter expansion ---------------- */
+
+static size_t utf8_strlen(const char *s) {
+    size_t n = 0;
+    for (; *s; s++) if (((unsigned char)*s & 0xC0) != 0x80) n++;
+    return n;
 }
 
-typedef enum { ARR_NOT_ARRAY, ARR_SINGLE, ARR_MULTI } ArrBraceResult;
-
-/* Parses a "name", "name[index]", "name[@|*]" or "#name[...]" brace-body
- * (as captured by scan_balanced_braces) as a possible array reference.
- * `inner` is always freed. */
-static ArrBraceResult try_array_brace(char *inner, strvec_t *multi, char **single) {
-    bool has_hash = (inner[0] == '#' && inner[1] != '\0');
-    const char *namestart = has_hash ? inner + 1 : inner;
-    size_t nl = 0;
-    while (namestart[nl] && namestart[nl] != '[' && namestart[nl] != ':') nl++;
-    char *name = xstrndup(namestart, nl);
-
-    if (!array_exists(name)) { free(name); free(inner); return ARR_NOT_ARRAY; }
-
-    if (namestart[nl] != '[') {
-        /* bare ${arr} / ${#arr} where arr is an array: bash treats this as
-         * element 0 (or its length). */
-        const char *el = array_get_index(name, 0);
-        if (has_hash) { char buf[32]; snprintf(buf, sizeof(buf), "%zu", el ? strlen(el) : 0); *single = xstrdup(buf); }
-        else *single = xstrdup(el ? el : "");
-        free(name); free(inner);
-        return ARR_SINGLE;
+static char *str_case(const char *v, int mode, bool first_only) {
+    /* mode: 1 upper, -1 lower, 0 toggle */
+    char *r = xstrdup(v);
+    for (char *q = r; *q; q++) {
+        unsigned char c = (unsigned char)*q;
+        if (mode > 0) *q = (char)toupper(c);
+        else if (mode < 0) *q = (char)tolower(c);
+        else *q = (char)(isupper(c) ? tolower(c) : toupper(c));
+        if (first_only) break;
     }
+    return r;
+}
 
-    const char *ip = namestart + nl + 1;
-    const char *istart = ip;
-    while (*ip && *ip != ']') ip++;
-    char *idxtext = xstrndup(istart, (size_t)(ip - istart));
-    ArrBraceResult result = ARR_SINGLE;
-
-    if (has_hash) {
-        long len;
-        if (strcmp(idxtext, "@") == 0 || strcmp(idxtext, "*") == 0) len = (long)array_len(name);
-        else { const char *el = array_get_index(name, arith_eval(idxtext)); len = el ? (long)strlen(el) : 0; }
-        char buf[32]; snprintf(buf, sizeof(buf), "%ld", len);
-        *single = xstrdup(buf);
-    } else if (strcmp(idxtext, "@") == 0) {
-        array_get_all(name, multi);
-        result = ARR_MULTI;
-    } else if (strcmp(idxtext, "*") == 0) {
-        strvec_t tmp; sv_init(&tmp);
-        array_get_all(name, &tmp);
-        dstr_t d; ds_init(&d);
-        for (size_t k = 0; k < tmp.count; k++) { if (k) ds_append_c(&d, ' '); ds_append(&d, tmp.items[k]); }
-        *single = xstrdup(d.data);
-        ds_free(&d); sv_free(&tmp);
+/* ${v#pat} ${v##pat} ${v%pat} ${v%%pat} */
+static char *remove_pattern(const char *v, const char *pat, bool prefix, bool longest) {
+    size_t n = strlen(v);
+    char *buf = xmalloc(n + 1);
+    if (prefix) {
+        for (size_t k = 0; k <= n; k++) {
+            size_t i = longest ? n - k : k;
+            memcpy(buf, v, i); buf[i] = '\0';
+            if (fnmatch(pat, buf, 0) == 0) { free(buf); return xstrdup(v + i); }
+        }
     } else {
-        const char *el = array_get_index(name, arith_eval(idxtext));
-        *single = xstrdup(el ? el : "");
+        for (size_t k = 0; k <= n; k++) {
+            size_t i = longest ? k : n - k; /* suffix starts at i */
+            if (fnmatch(pat, v + i, 0) == 0) { free(buf); return xstrndup(v, i); }
+        }
     }
-    free(idxtext); free(name); free(inner);
-    return result;
+    free(buf);
+    return xstrdup(v);
+}
+
+/* longest match of `pat` starting exactly at v[start]; returns its length or -1 */
+static long match_at(const char *v, size_t start, const char *pat, bool must_reach_end) {
+    size_t n = strlen(v);
+    char *buf = xmalloc(n + 1);
+    for (size_t end = n; ; end--) {
+        if (!must_reach_end || end == n) {
+            memcpy(buf, v + start, end - start); buf[end - start] = '\0';
+            if (fnmatch(pat, buf, 0) == 0) { free(buf); return (long)(end - start); }
+        }
+        if (end == start) break;
+    }
+    free(buf);
+    return -1;
+}
+
+/* ${v/pat/rep} ${v//pat/rep} ${v/#pat/rep} ${v/%pat/rep} */
+static char *substitute(const char *v, const char *pat, const char *rep, char mode) {
+    dstr_t d; ds_init(&d);
+    size_t n = strlen(v);
+    size_t i = 0;
+    bool done = false;
+    if (!*pat) return xstrdup(v);
+    while (i <= n) {
+        if (!done && (mode != '#' || i == 0) ) {
+            long m = match_at(v, i, pat, mode == '%');
+            if (m > 0 || (m == 0 && mode == '%')) {
+                ds_append(&d, rep);
+                i += (size_t)m;
+                if (mode != '/') done = true;
+                if (m == 0) { if (i < n) ds_append_c(&d, v[i]); i++; }
+                continue;
+            }
+        }
+        if (i < n) ds_append_c(&d, v[i]);
+        i++;
+    }
+    char *r = xstrdup(d.data);
+    ds_free(&d);
+    return r;
+}
+
+static char *quote_for_shell(const char *v) {
+    dstr_t d; ds_init(&d);
+    ds_append_c(&d, '\'');
+    for (; *v; v++) { if (*v == '\'') ds_append(&d, "'\\''"); else ds_append_c(&d, *v); }
+    ds_append_c(&d, '\'');
+    char *r = xstrdup(d.data); ds_free(&d); return r;
+}
+
+/* splits "pat/rep" at the first unescaped, unquoted '/' */
+static void split_slash(const char *s, char **pat, char **rep) {
+    bool insq = false, indq = false;
+    for (const char *p = s; *p; p++) {
+        if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '\'' && !indq) insq = !insq;
+        else if (*p == '"' && !insq) indq = !indq;
+        else if (*p == '/' && !insq && !indq) { *pat = xstrndup(s, (size_t)(p - s)); *rep = xstrdup(p + 1); return; }
+    }
+    *pat = xstrdup(s); *rep = xstrdup("");
+}
+
+/* applies one operator suffix (`#pat`, `/a/b`, `^^`, `:1:2`, ...) to a value */
+static char *apply_value_op(const char *v, const char *op) {
+    if (!*op) return xstrdup(v);
+    if (op[0] == '#' || op[0] == '%') {
+        bool longest = op[1] == op[0];
+        char *pat = expand_pattern_single(op + (longest ? 2 : 1));
+        char *r = remove_pattern(v, pat, op[0] == '#', longest);
+        free(pat);
+        return r;
+    }
+    if (op[0] == '/') {
+        char mode = '1';
+        const char *body = op + 1;
+        if (*body == '/') { mode = '/'; body++; }
+        else if (*body == '#') { mode = '#'; body++; }
+        else if (*body == '%') { mode = '%'; body++; }
+        char *praw, *rraw;
+        split_slash(body, &praw, &rraw);
+        char *pat = expand_pattern_single(praw);
+        char *rep = expand_pattern_single(rraw);
+        char *r = substitute(v, pat, rep, mode);
+        free(praw); free(rraw); free(pat); free(rep);
+        return r;
+    }
+    if (op[0] == '^') return str_case(v, 1, op[1] != '^');
+    if (op[0] == ',') return str_case(v, -1, op[1] != ',');
+    if (op[0] == '~') return str_case(v, 0, op[1] != '~');
+    if (op[0] == '@') {
+        switch (op[1]) {
+            case 'Q': return quote_for_shell(v);
+            case 'U': return str_case(v, 1, false);
+            case 'L': return str_case(v, -1, false);
+            case 'u': return str_case(v, 1, true);
+            default: return xstrdup(v);
+        }
+    }
+    if (op[0] == ':') {
+        /* substring ${v:off} / ${v:off:len} */
+        const char *rest = op + 1;
+        const char *colon = strchr(rest, ':');
+        char *offs = colon ? xstrndup(rest, (size_t)(colon - rest)) : xstrdup(rest);
+        long n = (long)strlen(v);
+        long off = arith_eval(offs);
+        free(offs);
+        if (off < 0) off += n;
+        if (off < 0) off = 0;
+        if (off > n) off = n;
+        long len = n - off;
+        if (colon) {
+            len = arith_eval(colon + 1);
+            if (len < 0) len = (n - off) + len;
+            if (len < 0) len = 0;
+            if (off + len > n) len = n - off;
+        }
+        return xstrndup(v + off, (size_t)len);
+    }
+    return xstrdup(v);
+}
+
+static bool is_special_param(char c) {
+    return c == '@' || c == '*' || c == '#' || c == '?' || c == '$' || c == '!' || c == '-' || isdigit((unsigned char)c);
+}
+
+static char *param_scalar(const char *name) {
+    if (strcmp(name, "-") == 0) return xstrdup("");
+    if (array_exists(name)) { const char *el = array_get_index(name, 0); return xstrdup(el ? el : ""); }
+    const char *v = var_get(name);
+    return v ? xstrdup(v) : NULL;
+}
+
+static void positional_all(strvec_t *out) {
+    for (size_t i = 0; i < exec_positional_count(); i++) sv_push_dup(out, exec_positional_get(i));
+}
+
+static bool expand_brace_param(const char *inner, bool quoted, strvec_t *multi, char **single);
+
+/* `inner` is the text between ${ and }. Returns true with *single set,
+ * or false with *multi filled (one word per element). */
+static bool expand_brace_param(const char *inner, bool quoted, strvec_t *multi, char **single) {
+    const char *p = inner;
+    bool length = false, indirect = false;
+    if (p[0] == '#' && p[1] && p[1] != '}' && !(p[1] == '#' || p[1] == '%' || p[1] == ':' || p[1] == '/')) { length = true; p++; }
+    else if (p[0] == '!' && p[1]) { indirect = true; p++; }
+
+    /* name */
+    const char *ns = p;
+    if (isalpha((unsigned char)*p) || *p == '_') { while (isalnum((unsigned char)*p) || *p == '_') p++; }
+    else if (isdigit((unsigned char)*p)) { while (isdigit((unsigned char)*p)) p++; }
+    else if (is_special_param(*p)) p++;
+    char *name = xstrndup(ns, (size_t)(p - ns));
+    if (!*name) { free(name); *single = xstrdup(""); return true; }
+
+    /* subscript */
+    char *sub = NULL;
+    if (*p == '[') {
+        const char *ss = ++p;
+        int depth = 1;
+        while (*p && depth) { if (*p == '[') depth++; else if (*p == ']') depth--; if (depth) p++; }
+        sub = xstrndup(ss, (size_t)(p - ss));
+        if (*p == ']') p++;
+    }
+    const char *op = p;
+
+    if (indirect) {
+        /* ${!arr[@]} -> indices; ${!prefix*} -> names; ${!name} -> indirection */
+        if (sub && (strcmp(sub, "@") == 0 || strcmp(sub, "*") == 0)) {
+            size_t n = array_exists(name) ? array_len(name) : (var_get(name) ? 1 : 0);
+            char buf[32];
+            for (size_t i = 0; i < n; i++) { snprintf(buf, sizeof(buf), "%zu", i); sv_push_dup(multi, buf); }
+            free(name); free(sub);
+            return false;
+        }
+        if (!sub && (strcmp(op, "*") == 0 || strcmp(op, "@") == 0)) {
+            strvec_t names; sv_init(&names);
+            vars_dump(&names);
+            arrays_dump(&names);
+            size_t nl = strlen(name);
+            for (size_t i = 0; i < names.count; i++)
+                if (strncmp(names.items[i], name, nl) == 0) sv_push_dup(multi, names.items[i]);
+            sv_free(&names);
+            /* sort for stable output */
+            for (size_t i = 1; i < multi->count; i++)
+                for (size_t j = i; j > 0 && strcmp(multi->items[j-1], multi->items[j]) > 0; j--) {
+                    char *t = multi->items[j]; multi->items[j] = multi->items[j-1]; multi->items[j-1] = t;
+                }
+            free(name);
+            return false;
+        }
+        char *target = param_scalar(name);
+        free(name); free(sub);
+        if (!target || !*target) { free(target); *single = xstrdup(""); return true; }
+        dstr_t d; ds_init(&d); ds_append(&d, target); ds_append(&d, op);
+        bool r = expand_brace_param(d.data, quoted, multi, single);
+        ds_free(&d); free(target);
+        return r;
+    }
+
+    /* fetch the value(s) */
+    strvec_t vals; sv_init(&vals);
+    bool is_list = false, star_join = false, is_set = true;
+    if (strcmp(name, "@") == 0 || strcmp(name, "*") == 0) {
+        positional_all(&vals);
+        is_list = true; star_join = name[0] == '*';
+        is_set = vals.count > 0;
+    } else if (sub && (strcmp(sub, "@") == 0 || strcmp(sub, "*") == 0)) {
+        if (array_exists(name)) array_get_all(name, &vals);
+        else { const char *v = var_get(name); if (v) sv_push_dup(&vals, v); }
+        is_list = true; star_join = sub[0] == '*';
+        is_set = vals.count > 0;
+    } else if (sub) {
+        const char *el = NULL;
+        if (array_exists(name)) el = array_get_index(name, arith_eval(sub));
+        else if (arith_eval(sub) == 0) el = var_get(name);
+        if (el) sv_push_dup(&vals, el); else is_set = false;
+    } else {
+        char *v = param_scalar(name);
+        if (v) sv_push(&vals, v); else is_set = false;
+    }
+    free(sub);
+
+    if (length) {
+        char buf[32];
+        if (is_list) snprintf(buf, sizeof(buf), "%zu", vals.count);
+        else snprintf(buf, sizeof(buf), "%zu", vals.count ? utf8_strlen(vals.items[0]) : (size_t)0);
+        sv_free(&vals); free(name);
+        *single = xstrdup(buf);
+        return true;
+    }
+
+    /* default / alternate / assign / error operators */
+    bool colon = op[0] == ':' && (op[1] == '-' || op[1] == '=' || op[1] == '+' || op[1] == '?');
+    char kind = colon ? op[1] : ((op[0] == '-' || op[0] == '=' || op[0] == '+' || op[0] == '?') ? op[0] : 0);
+    if (kind) {
+        const char *word = op + (colon ? 2 : 1);
+        bool empty = !is_set || (colon && (vals.count == 0 || (vals.count == 1 && vals.items[0][0] == '\0')));
+        char *result = NULL;
+        if (kind == '-') { if (empty) result = expand_pattern_single(word); }
+        else if (kind == '=') {
+            if (empty) { result = expand_pattern_single(word); var_set(name, result, var_is_exported(name)); }
+        } else if (kind == '+') { result = empty ? xstrdup("") : expand_pattern_single(word); }
+        else if (kind == '?') {
+            if (empty) {
+                char *msg = expand_pattern_single(word);
+                sh_err("%s: %s\n", name, *msg ? msg : "parameter null or not set");
+                free(msg);
+                if (!g_shell_is_interactive) { g_should_exit = true; g_exit_code = 1; }
+                result = xstrdup("");
+            }
+        }
+        free(name);
+        if (result) { sv_free(&vals); *single = result; return true; }
+        op = ""; /* value is used as-is */
+    } else {
+        free(name);
+    }
+
+    /* slicing a list: ${arr[@]:1:2}, ${@:2} */
+    if (is_list && op[0] == ':') {
+        const char *rest = op + 1;
+        const char *c2 = strchr(rest, ':');
+        char *offs = c2 ? xstrndup(rest, (size_t)(c2 - rest)) : xstrdup(rest);
+        long n = (long)vals.count;
+        long off = arith_eval(offs);
+        free(offs);
+        if (star_join == false && op == p && ns[0] == '@') off -= 1; /* ${@:1} starts at $1 */
+        else if (ns[0] == '*' && !sub) off -= 1;
+        if (off < 0) off += n;
+        if (off < 0) off = 0;
+        if (off > n) off = n;
+        long len = c2 ? arith_eval(c2 + 1) : n - off;
+        if (len < 0) len = 0;
+        if (off + len > n) len = n - off;
+        strvec_t sl; sv_init(&sl);
+        for (long i = off; i < off + len; i++) sv_push_dup(&sl, vals.items[i]);
+        sv_free(&vals);
+        vals = sl;
+        op = "";
+    }
+
+    for (size_t i = 0; i < vals.count; i++) {
+        char *nv = apply_value_op(vals.items[i], op);
+        free(vals.items[i]);
+        vals.items[i] = nv;
+    }
+
+    if (is_list && !(star_join && quoted)) {
+        for (size_t i = 0; i < vals.count; i++) sv_push_dup(multi, vals.items[i]);
+        sv_free(&vals);
+        return false;
+    }
+    dstr_t d; ds_init(&d);
+    for (size_t i = 0; i < vals.count; i++) { if (i) ds_append_c(&d, ' '); ds_append(&d, vals.items[i]); }
+    *single = xstrdup(d.data);
+    ds_free(&d);
+    sv_free(&vals);
+    return true;
+}
+
+/* fish list indexing after $name: [N], [-1], [2..4]  (1-based). Returns
+ * false if the bracket text isn't a fish index (leave it literal). */
+static bool parse_fish_index(const char **pp, long *from, long *to) {
+    const char *p = *pp;
+    if (*p != '[') return false;
+    p++;
+    char *end;
+    long a = strtol(p, &end, 10);
+    if (end == p) return false;
+    long b = a;
+    p = end;
+    if (p[0] == '.' && p[1] == '.') {
+        p += 2;
+        b = strtol(p, &end, 10);
+        if (end == p) return false;
+        p = end;
+    }
+    if (*p != ']') return false;
+    *pp = p + 1;
+    *from = a; *to = b;
+    return true;
 }
 
 /* *pp points just after '$'. Returns true for a single-value result (with
  * *single set, never NULL), or false with *multi populated instead (one
- * entry per array element — the "${arr[@]}" case). Advances *pp past the
- * construct either way; if '$' wasn't followed by anything expandable, *pp
- * is left unchanged and *single = "$". */
-static bool expand_dollar(const char **pp, strvec_t *multi, char **single) {
+ * entry per element -- "$@", "${arr[@]}", fish-style $list). Advances *pp
+ * past the construct either way; if '$' wasn't followed by anything
+ * expandable, *pp is left unchanged and *single = "$". */
+static bool expand_dollar(const char **pp, bool quoted, strvec_t *multi, char **single) {
     const char *p = *pp;
     if (p[0] == '(' && p[1] == '(') {
         char *src = scan_balanced_parens(&p);
         *pp = p;
-        long v = arith_eval(src);
+        size_t sl = strlen(src);
+        /* scan_balanced_parens on "((x))" yields "(x)": strip the inner pair */
+        if (sl >= 2 && src[0] == '(' && src[sl-1] == ')') { src[sl-1] = '\0'; memmove(src, src + 1, sl - 1); }
+        char *ex = expand_heredoc_body(src); /* allow $var / $(cmd) inside */
+        long v = arith_eval(ex);
+        free(ex);
         free(src);
         char buf[32]; snprintf(buf, sizeof(buf), "%ld", v);
         *single = xstrdup(buf);
@@ -188,18 +483,20 @@ static bool expand_dollar(const char **pp, strvec_t *multi, char **single) {
     if (*p == '{') {
         char *inner = scan_balanced_braces(&p);
         *pp = p;
-        char *inner_copy = xstrdup(inner);
-        ArrBraceResult ar = try_array_brace(inner, multi, single);
-        if (ar == ARR_SINGLE) { free(inner_copy); return true; }
-        if (ar == ARR_MULTI) { free(inner_copy); return false; }
-        *single = resolve_brace_expr(inner_copy);
-        return true;
+        bool r = expand_brace_param(inner, quoted, multi, single);
+        free(inner);
+        return r;
     }
-    if (*p == '?' || *p == '$' || *p == '#' || *p == '@' || *p == '*' || (*p >= '0' && *p <= '9')) {
+    if (*p == '@') {
+        *pp = p + 1;
+        positional_all(multi);
+        return false;
+    }
+    if (*p == '?' || *p == '$' || *p == '#' || *p == '*' || *p == '!' || *p == '-' || (*p >= '0' && *p <= '9')) {
         char name[2] = { *p, '\0' };
         p++;
         *pp = p;
-        const char *v = var_get(name);
+        const char *v = name[0] == '-' ? "" : var_get(name);
         *single = xstrdup(v ? v : "");
         return true;
     }
@@ -207,19 +504,90 @@ static bool expand_dollar(const char **pp, strvec_t *multi, char **single) {
         const char *start = p;
         while (isalnum((unsigned char)*p) || *p == '_') p++;
         char *name = xstrndup(start, (size_t)(p - start));
-        *pp = p;
         if (array_exists(name)) {
-            const char *el = array_get_index(name, 0);
-            *single = xstrdup(el ? el : "");
-        } else {
-            const char *v = var_get(name);
-            *single = xstrdup(v ? v : "");
+            /* fish semantics for the brace-less form: $list is every
+             * element, $list[2] / $list[-1] / $list[2..3] index from 1 */
+            strvec_t all; sv_init(&all);
+            array_get_all(name, &all);
+            long from, to;
+            strvec_t sel; sv_init(&sel);
+            if (parse_fish_index(&p, &from, &to)) {
+                long n = (long)all.count;
+                if (from < 0) from += n + 1;
+                if (to < 0) to += n + 1;
+                long step = from <= to ? 1 : -1;
+                for (long i = from; ; i += step) {
+                    if (i >= 1 && i <= n) sv_push_dup(&sel, all.items[i - 1]);
+                    if (i == to) break;
+                }
+            } else {
+                for (size_t i = 0; i < all.count; i++) sv_push_dup(&sel, all.items[i]);
+            }
+            sv_free(&all);
+            *pp = p;
+            free(name);
+            if (quoted) {
+                dstr_t d; ds_init(&d);
+                for (size_t i = 0; i < sel.count; i++) { if (i) ds_append_c(&d, ' '); ds_append(&d, sel.items[i]); }
+                *single = xstrdup(d.data);
+                ds_free(&d);
+                sv_free(&sel);
+                return true;
+            }
+            for (size_t i = 0; i < sel.count; i++) sv_push_dup(multi, sel.items[i]);
+            sv_free(&sel);
+            return false;
         }
+        *pp = p;
+        const char *v = var_get(name);
+        if (!v && g_opt_nounset) {
+            sh_err("%s: unbound variable\n", name);
+            if (!g_shell_is_interactive) { g_should_exit = true; g_exit_code = 1; }
+        }
+        *single = xstrdup(v ? v : "");
         free(name);
         return true;
     }
     *single = xstrdup("$"); /* literal '$', *pp left unchanged */
     return true;
+}
+
+/* $'...' ANSI-C quoting. *pp points at the opening quote. */
+static void ansi_c_quote(const char **pp, dstr_t *cur) {
+    const char *p = *pp + 1;
+    while (*p && *p != '\'') {
+        if (*p != '\\' || !p[1]) { ds_append_c(cur, *p++); continue; }
+        p++;
+        char c = *p++;
+        switch (c) {
+            case 'n': ds_append_c(cur, '\n'); break;
+            case 't': ds_append_c(cur, '\t'); break;
+            case 'r': ds_append_c(cur, '\r'); break;
+            case 'a': ds_append_c(cur, '\a'); break;
+            case 'b': ds_append_c(cur, '\b'); break;
+            case 'f': ds_append_c(cur, '\f'); break;
+            case 'v': ds_append_c(cur, '\v'); break;
+            case 'e': case 'E': ds_append_c(cur, 27); break;
+            case '\\': ds_append_c(cur, '\\'); break;
+            case '\'': ds_append_c(cur, '\''); break;
+            case '"': ds_append_c(cur, '"'); break;
+            case 'x': {
+                int v = 0, k = 0;
+                while (k < 2 && isxdigit((unsigned char)*p)) { v = v * 16 + (isdigit((unsigned char)*p) ? *p - '0' : (tolower((unsigned char)*p) - 'a' + 10)); p++; k++; }
+                ds_append_c(cur, (char)v);
+                break;
+            }
+            case '0': case '1': case '2': case '3': case '4': case '5': case '6': case '7': {
+                int v = c - '0', k = 1;
+                while (k < 3 && *p >= '0' && *p <= '7') { v = v * 8 + (*p - '0'); p++; k++; }
+                ds_append_c(cur, (char)v);
+                break;
+            }
+            default: ds_append_c(cur, '\\'); ds_append_c(cur, c); break;
+        }
+    }
+    if (*p == '\'') p++;
+    *pp = p;
 }
 
 /* Splits `val` on IFS whitespace, merging the first fragment into *cur and
@@ -339,6 +707,12 @@ static bool find_brace_group(const char *s, size_t *open_at, size_t *close_at) {
         if (c == '\'' && !indq) { insq = !insq; continue; }
         if (c == '"' && !insq) { indq = !indq; continue; }
         if (insq || indq) continue;
+        if (c == '{' && i > 0 && s[i-1] == '$') {
+            /* ${...} is parameter expansion, never a brace group */
+            int d = 1; i++;
+            while (i < n && d > 0) { if (s[i] == '{') d++; else if (s[i] == '}') d--; if (d) i++; }
+            continue;
+        }
         if (c != '{') continue;
 
         int depth = 1;
@@ -392,6 +766,80 @@ static void brace_expand_rec(const char *s, strvec_t *out, int depth) {
  * bash (brace expansion only sees unquoted braces). */
 static void brace_expand(const char *raw, strvec_t *out) { brace_expand_rec(raw, out, 0); }
 
+/* ---------------- ** recursive globbing ---------------- */
+
+static int cmp_str(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+
+/* matches path components comps[ci..] under directory `dir` (whose
+ * display prefix is `shown`), "**" matching zero or more directories */
+static void globstar_rec(const char *dir, const char *shown, char **comps, size_t ncomps, size_t ci, strvec_t *out, int depth) {
+    if (depth > 40) return;
+    if (ci == ncomps) { if (*shown) sv_push_dup(out, shown); return; }
+    const char *pat = comps[ci];
+    bool last = ci + 1 == ncomps;
+    if (strcmp(pat, "**") == 0) {
+        globstar_rec(dir, shown, comps, ncomps, ci + 1, out, depth); /* zero dirs */
+        DIR *d = opendir(*dir ? dir : ".");
+        if (!d) return;
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (e->d_name[0] == '.') continue;
+            char path[4096], disp[4096];
+            snprintf(path, sizeof(path), "%s%s%s", dir, *dir && dir[strlen(dir)-1] != '/' ? "/" : "", e->d_name);
+            snprintf(disp, sizeof(disp), "%s%s%s", shown, *shown && shown[strlen(shown)-1] != '/' ? "/" : "", e->d_name);
+            struct stat st;
+            if (lstat(path, &st) == 0 && S_ISDIR(st.st_mode))
+                globstar_rec(path, disp, comps, ncomps, ci, out, depth + 1);
+        }
+        closedir(d);
+        return;
+    }
+    DIR *d = opendir(*dir ? dir : ".");
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.' && pat[0] != '.') continue;
+        if (fnmatch(pat, e->d_name, 0) != 0) continue;
+        char path[4096], disp[4096];
+        snprintf(path, sizeof(path), "%s%s%s", dir, *dir && dir[strlen(dir)-1] != '/' ? "/" : "", e->d_name);
+        snprintf(disp, sizeof(disp), "%s%s%s", shown, *shown && shown[strlen(shown)-1] != '/' ? "/" : "", e->d_name);
+        if (last) { sv_push_dup(out, disp); continue; }
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+            globstar_rec(path, disp, comps, ncomps, ci + 1, out, depth + 1);
+    }
+    closedir(d);
+}
+
+static bool globstar(const char *pattern, strvec_t *out) {
+    strvec_t comps; sv_init(&comps);
+    const char *p = pattern;
+    bool absolute = *p == '/';
+    while (*p) {
+        while (*p == '/') p++;
+        const char *s0 = p;
+        while (*p && *p != '/') p++;
+        if (p == s0) continue;
+        char *c = xstrndup(s0, (size_t)(p - s0));
+        char *ss = strstr(c, "**");
+        if (ss && strcmp(c, "**") != 0) {
+            /* fish: `**.txt` = any depth, then `*.txt` */
+            sv_push_dup(&comps, "**");
+            memmove(ss, ss + 1, strlen(ss));
+        }
+        sv_push(&comps, c);
+    }
+    strvec_t found; sv_init(&found);
+    globstar_rec(absolute ? "/" : "", absolute ? "/" : "", comps.items, comps.count, 0, &found, 0);
+    sv_free(&comps);
+    if (found.count == 0) { sv_free(&found); return false; }
+    qsort(found.items, found.count, sizeof(char *), cmp_str);
+    for (size_t i = 0; i < found.count; i++)
+        if (i == 0 || strcmp(found.items[i], found.items[i-1]) != 0) sv_push_dup(out, found.items[i]);
+    sv_free(&found);
+    return true;
+}
+
 static void expand_word_impl(const char *raw, strvec_t *out, bool do_glob) {
     dstr_t cur; ds_init(&cur);
     bool force_emit = false;
@@ -404,6 +852,19 @@ static void expand_word_impl(const char *raw, strvec_t *out, bool do_glob) {
         ds_append(&cur, home ? home : "~");
         force_emit = true;
         i = 1;
+    } else if (n > 1 && raw[0] == '~' && (isalpha((unsigned char)raw[1]) || raw[1] == '_')) {
+        /* ~user and ~user/path */
+        size_t e = 1;
+        while (e < n && (isalnum((unsigned char)raw[e]) || raw[e] == '_' || raw[e] == '-' || raw[e] == '.')) e++;
+        if (e == n || raw[e] == '/') {
+            char *user = xstrndup(raw + 1, e - 1);
+            struct passwd *pw = getpwnam(user);
+            free(user);
+            if (pw) { ds_append(&cur, pw->pw_dir); force_emit = true; i = e; }
+        }
+    } else if (n > 1 && raw[0] == '~' && (raw[1] == '+' || raw[1] == '-') && (n == 2 || raw[2] == '/')) {
+        const char *d = var_get(raw[1] == '+' ? "PWD" : "OLDPWD");
+        if (d) { ds_append(&cur, d); force_emit = true; i = 2; }
     }
 
     while (i < n) {
@@ -428,9 +889,9 @@ static void expand_word_impl(const char *raw, strvec_t *out, bool do_glob) {
                     const char *p = raw + i + 1;
                     strvec_t multi; sv_init(&multi);
                     char *val = NULL;
-                    bool single = expand_dollar(&p, &multi, &val);
+                    bool single = expand_dollar(&p, true, &multi, &val);
                     if (single) { ds_append(&cur, val); free(val); }
-                    else append_array_multi(&cur, out, &multi);
+                    else { append_array_multi(&cur, out, &multi); if (multi.count == 0) force_emit = false; }
                     sv_free(&multi);
                     i = (size_t)(p - raw);
                     continue;
@@ -456,12 +917,29 @@ static void expand_word_impl(const char *raw, strvec_t *out, bool do_glob) {
             if (i < n) { ds_append_c(&cur, raw[i]); i++; }
             continue;
         }
+        if (c == '$' && i + 1 < n && raw[i+1] == '\'') {
+            const char *p = raw + i + 1;
+            ansi_c_quote(&p, &cur);
+            force_emit = true;
+            i = (size_t)(p - raw);
+            continue;
+        }
+        if ((c == '<' || c == '>') && i + 1 < n && raw[i+1] == '(') {
+            const char *p = raw + i + 1;
+            char *src = scan_balanced_parens(&p);
+            char *path = exec_procsub(src, c == '<');
+            ds_append(&cur, path);
+            free(path); free(src);
+            force_emit = true;
+            i = (size_t)(p - raw);
+            continue;
+        }
         if (c == '$') {
             const char *p = raw + i + 1;
             size_t before = (size_t)(p - raw);
             strvec_t multi; sv_init(&multi);
             char *val = NULL;
-            bool single = expand_dollar(&p, &multi, &val);
+            bool single = expand_dollar(&p, false, &multi, &val);
             size_t after = (size_t)(p - raw);
             if (single && after == before) {
                 force_emit = true;
@@ -504,7 +982,9 @@ static void expand_word_impl(const char *raw, strvec_t *out, bool do_glob) {
     }
 
     if (force_emit || cur.len > 0) {
-        if (do_glob && glob_eligible && cur.len > 0) {
+        if (do_glob && glob_eligible && cur.len > 0 && strstr(cur.data, "**")) {
+            if (globstar(cur.data, out)) { ds_free(&cur); return; }
+        } else if (do_glob && glob_eligible && cur.len > 0) {
             glob_t g;
             int r = glob(cur.data, GLOB_NOCHECK, NULL, &g);
             if (r == 0 && g.gl_pathc > 0) {
@@ -582,7 +1062,7 @@ char *expand_heredoc_body(const char *raw) {
             const char *p = raw + i + 1;
             strvec_t multi; sv_init(&multi);
             char *val = NULL;
-            bool single = expand_dollar(&p, &multi, &val);
+            bool single = expand_dollar(&p, true, &multi, &val);
             if (single) { ds_append(&cur, val); free(val); }
             else {
                 for (size_t k = 0; k < multi.count; k++) {

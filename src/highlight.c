@@ -7,10 +7,12 @@
 #include "vars.h"
 #include <ctype.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 static const char *g_keywords[] = {
     "if", "then", "else", "elif", "fi", "end", "for", "while", "until", "do", "done",
-    "function", "in", "begin", "case", "esac", "switch", "[[", "]]", "!", NULL
+    "function", "in", "begin", "case", "esac", "switch", "[[", "]]", "!", "and", "or", "not",
+    "time", "{", "}", NULL
 };
 
 static bool is_keyword(const char *w) {
@@ -68,7 +70,8 @@ static size_t scan_word_len(const char *s, size_t i, size_t n) {
         char c = s[i];
         if (!insq && !indq && !inbt && depth == 0) {
             if (isspace((unsigned char)c)) break;
-            if (c=='|'||c=='&'||c==';'||c=='<'||c=='>'||c=='#') break;
+            if (c=='|'||c=='&'||c==';'||c=='<'||c=='>') break;
+            if (c=='#' && i == start) break;
         }
         if (c == '\\' && !insq) { i++; if (i < n) i++; continue; }
         if (c == '\'' && !indq && !inbt) { insq = !insq; i++; continue; }
@@ -101,9 +104,10 @@ static SegType next_segment(const char *s, size_t *pos, size_t *seglen) {
     }
     if (c == '|' || c == '&' || c == ';' || c == '<' || c == '>') {
         size_t start = i;
-        if (c == '|') { i++; if (i<n && s[i]=='|') i++; }
-        else if (c == '&') { i++; if (i<n && (s[i]=='&'||s[i]=='>')) i++; }
-        else if (c == '>') { i++; if (i<n && s[i]=='>') i++; }
+        if (c == '|') { i++; if (i<n && (s[i]=='|' || s[i]=='&')) i++; }
+        else if (c == '&') { i++; if (i<n && s[i]=='&') i++; else if (i<n && s[i]=='>') { i++; if (i<n && s[i]=='>') i++; } }
+        else if (c == '>') { i++; if (i<n && (s[i]=='>' || s[i]=='|')) i++; if (i<n && s[i]=='&') i++; }
+        else if (c == '<') { i++; while (i<n && s[i]=='<' && i - start < 3) i++; if (i<n && (s[i]=='&' || s[i]=='>' || s[i]=='-')) i++; }
         else i++;
         *seglen = i - start; *pos = i;
         return SEG_OP;
@@ -147,15 +151,36 @@ static void emit_word(dstr_t *out, const char *word, size_t len, const char *bas
             color_wrap_n(out, config_color("string"), word + seg_start, i - seg_start);
             continue;
         }
+        if (word[i] == '$' && i + 1 < len && word[i + 1] == '(' && !(i + 2 < len && word[i + 2] == '(')) {
+            /* command substitution: highlight the inner command line too */
+            size_t inner = i + 2, j = inner;
+            int depth = 1;
+            while (j < len && depth) { if (word[j] == '(') depth++; else if (word[j] == ')') depth--; if (depth) j++; }
+            color_wrap_n(out, config_color("operator"), "$(", 2);
+            char *sub = xstrndup(word + inner, j - inner);
+            char *hl = highlight_line(sub);
+            ds_append(out, hl);
+            free(hl); free(sub);
+            if (j < len) { color_wrap_n(out, config_color("operator"), ")", 1); j++; }
+            i = j;
+            continue;
+        }
         if (word[i] == '$') {
             size_t vstart = i; i++;
-            if (i < len && word[i] == '{') { i++; while (i < len && word[i] != '}') i++; if (i < len) i++; }
+            if (i < len && word[i] == '{') { i++; int d = 1; while (i < len && d) { if (word[i] == '{') d++; else if (word[i] == '}') d--; i++; } }
+            else if (i < len && word[i] == '(') { int d = 0; do { if (word[i] == '(') d++; else if (word[i] == ')') d--; i++; } while (i < len && d); }
+            else if (i < len && strchr("?$#@*!0123456789-", word[i])) i++;
             else { while (i < len && (isalnum((unsigned char)word[i]) || word[i] == '_')) i++; }
             color_wrap_n(out, config_color("variable"), word + vstart, i - vstart);
             continue;
         }
+        if (word[i] == '\\' && i + 1 < len) {
+            color_wrap_n(out, config_color("escape"), word + i, 2);
+            i += 2;
+            continue;
+        }
         size_t start = i;
-        while (i < len && word[i] != '\'' && word[i] != '"' && word[i] != '$' && word[i] != '[') i++;
+        while (i < len && word[i] != '\'' && word[i] != '"' && word[i] != '$' && word[i] != '[' && word[i] != '\\') i++;
         color_wrap_n(out, config_color(base_class), word + start, i - start);
         if (i < len && word[i] == '[') {
             size_t bstart = i; i++;
@@ -166,10 +191,50 @@ static void emit_word(dstr_t *out, const char *word, size_t len, const char *bas
     }
 }
 
+/* does the (plain, unquoted) word name an existing file? `~/` is expanded */
+static bool path_exists(const char *w) {
+    char path[4096];
+    if (w[0] == '~' && (w[1] == '/' || w[1] == '\0')) {
+        const char *home = var_get("HOME");
+        snprintf(path, sizeof(path), "%s%s", home ? home : "", w + 1);
+    } else {
+        size_t k = 0;
+        for (const char *p = w; *p && k < sizeof(path) - 1; p++) { if (*p == '\\' && p[1]) p++; path[k++] = *p; }
+        path[k] = '\0';
+    }
+    if (!path[0]) return false;
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+static void emit_path(dstr_t *out, const char *seg, size_t len, const char *cls) {
+    char *code = ansi_code_for(config_color(cls));
+    ds_append(out, code);
+    ds_append(out, "\x1b[4m");
+    ds_append_n(out, seg, len);
+    ds_append(out, ANSI_RESET);
+    free(code);
+}
+
+static bool is_redirect_op(const char *seg, size_t len) {
+    for (size_t k = 0; k < len; k++) if (seg[k] == '<' || seg[k] == '>') return true;
+    return false;
+}
+
+static bool is_assignment_word(const char *w) {
+    if (!isalpha((unsigned char)*w) && *w != '_') return false;
+    while (isalnum((unsigned char)*w) || *w == '_') w++;
+    if (*w == '[') { while (*w && *w != ']') w++; if (*w) w++; }
+    if (*w == '+') w++;
+    return *w == '=';
+}
+
 char *highlight_line(const char *buf) {
     dstr_t out; ds_init(&out);
     size_t pos = 0, seglen = 0;
     bool at_cmd_pos = true;
+    bool redirect_target = false;
+    bool valid_paths = strcmp(config_get("highlight.valid_paths", "yes"), "no") != 0;
 
     for (;;) {
         SegType t = next_segment(buf, &pos, &seglen);
@@ -183,8 +248,16 @@ char *highlight_line(const char *buf) {
                 color_wrap_n(&out, config_color("comment"), seg, seglen);
                 break;
             case SEG_OP:
-                color_wrap_n(&out, config_color("operator"), seg, seglen);
-                at_cmd_pos = true;
+                if (is_redirect_op(seg, seglen)) {
+                    color_wrap_n(&out, config_color("redirect"), seg, seglen);
+                    /* `>&2` / `2>&1`: the fd after & is not a file */
+                    redirect_target = !(seglen > 0 && seg[seglen - 1] == '&' && seg[0] != '&');
+                    if (!redirect_target) redirect_target = false;
+                    if (seglen > 1 && seg[seglen - 1] == '&') redirect_target = false;
+                } else {
+                    color_wrap_n(&out, config_color("operator"), seg, seglen);
+                    at_cmd_pos = true;
+                }
                 break;
             case SEG_WORD: {
                 char *word = xstrndup(seg, seglen);
@@ -192,7 +265,20 @@ char *highlight_line(const char *buf) {
                 for (size_t k = 0; k < seglen; k++)
                     if (seg[k]=='\''||seg[k]=='"'||seg[k]=='$'||seg[k]=='\\') { plain_bareword = false; break; }
 
-                if (at_cmd_pos && plain_bareword && is_keyword(word)) {
+                if (redirect_target) {
+                    redirect_target = false;
+                    if (plain_bareword && valid_paths && path_exists(word)) emit_path(&out, seg, seglen, "path");
+                    else emit_word(&out, seg, seglen, "path");
+                } else if (at_cmd_pos && is_assignment_word(word)) {
+                    /* VAR=value prefix: name, '=', then the value */
+                    const char *eq = strchr(seg, '=');
+                    size_t nl = (size_t)(eq - seg);
+                    if (nl > 0 && seg[nl - 1] == '+') nl--;
+                    color_wrap_n(&out, config_color("variable"), seg, nl);
+                    size_t opl = (size_t)(eq - seg) + 1 - nl;
+                    color_wrap_n(&out, config_color("operator"), seg + nl, opl);
+                    if (seglen > nl + opl) emit_word(&out, seg + nl + opl, seglen - nl - opl, "text");
+                } else if (at_cmd_pos && plain_bareword && is_keyword(word)) {
                     color_wrap_n(&out, config_color("keyword"), seg, seglen);
                     /* "[[" is followed by a test expression, not a command;
                      * every other keyword stays at command position since
@@ -200,8 +286,12 @@ char *highlight_line(const char *buf) {
                     if (strcmp(word, "[[") == 0) at_cmd_pos = false;
                 } else if (at_cmd_pos) {
                     const char *cls;
+                    struct stat dst;
                     if (plain_bareword && builtin_exists(word)) cls = "builtin";
+                    else if (plain_bareword && func_get(word)) cls = "function";
                     else if (plain_bareword && command_exists(word)) cls = "command";
+                    else if (plain_bareword && abbr_get(word)) cls = "command";
+                    else if (plain_bareword && stat(word, &dst) == 0 && S_ISDIR(dst.st_mode)) cls = "path"; /* autocd */
                     else if (plain_bareword) cls = "command_invalid";
                     else cls = "text";
                     if (plain_bareword) color_wrap_n(&out, config_color(cls), seg, seglen);
@@ -216,7 +306,9 @@ char *highlight_line(const char *buf) {
                         (seglen > 1 && seg[0] == '.' && seg[1] == '/') ||
                         (seglen > 2 && seg[0] == '.' && seg[1] == '.' && seg[2] == '/') ||
                         (seglen > 1 && seg[0] == '~' && seg[1] == '/'));
-                    emit_word(&out, seg, seglen, looks_path ? "path" : "text");
+                    if (plain_bareword && valid_paths && (looks_path || strchr(word, '/') || seglen > 1) && path_exists(word))
+                        emit_path(&out, seg, seglen, "path");
+                    else emit_word(&out, seg, seglen, looks_path ? "path" : "text");
                 }
                 free(word);
                 break;

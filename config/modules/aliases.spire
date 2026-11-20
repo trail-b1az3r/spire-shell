@@ -2,13 +2,27 @@
 # Enable it by adding "aliases" to the `modules = ...` line in
 # ~/.config/spire/spire.conf, or run `module load aliases` at any time.
 
-alias ll='ls -la'
-alias la='ls -A'
-alias l='ls -CF'
+# colors for the usual suspects
+alias ls='ls --color=auto'
+alias ll='ls -la --color=auto'
+alias la='ls -A --color=auto'
+alias l='ls -CF --color=auto'
+alias grep='grep --color=auto'
+alias egrep='grep -E --color=auto'
+alias fgrep='grep -F --color=auto'
+alias diff='diff --color=auto'
+alias ip='ip -color=auto'
+export CLICOLOR=1
+
 alias ..='cd ..'
 alias ...='cd ../..'
-alias grep='grep --color=auto'
-alias gs='git status'
-alias gd='git diff'
-alias gc='git commit'
-alias gco='git checkout'
+alias ....='cd ../../..'
+alias md='mkdir -p'
+
+# fish-style abbreviations expand in place when you press space
+abbr -a gs git status
+abbr -a gd git diff
+abbr -a gc git commit
+abbr -a gco git checkout
+abbr -a gp git push
+abbr -a gl git log --oneline --graph --decorate
