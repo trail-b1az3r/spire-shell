@@ -156,3 +156,105 @@ size_t display_width_n(const char *s, size_t n) {
 }
 
 size_t display_width(const char *s) { return display_width_n(s, strlen(s)); }
+
+/* ---------------- fish color specs ---------------- */
+
+/* fish color word -> spire color name, or NULL if it isn't one */
+static const char *fish_color_name(const char *w, char *buf, size_t cap) {
+    if (strcmp(w, "normal") == 0 || strcmp(w, "reset") == 0) return "default";
+    if (strncmp(w, "br", 2) == 0 && strncmp(w, "bright", 6) != 0) {
+        snprintf(buf, cap, "bright%s", w + 2);
+        for (int i = 0; g_colors[i].name; i++) if (strcmp(g_colors[i].name, buf) == 0) return buf;
+    }
+    for (int i = 0; g_colors[i].name; i++) if (strcmp(g_colors[i].name, w) == 0) return w;
+    /* hex: RGB or RRGGBB, with or without # */
+    const char *h = w[0] == '#' ? w + 1 : w;
+    size_t n = strlen(h);
+    bool hex = (n == 3 || n == 6);
+    for (size_t i = 0; hex && i < n; i++) if (!isxdigit((unsigned char)h[i])) hex = false;
+    if (hex) {
+        if (n == 3) snprintf(buf, cap, "#%c%c%c%c%c%c", h[0], h[0], h[1], h[1], h[2], h[2]);
+        else snprintf(buf, cap, "#%s", h);
+        return buf;
+    }
+    return NULL;
+}
+
+typedef struct { char fg[48]; char bg[48]; bool bold, underline, italics, dim, reverse, reset; } FishColor;
+
+static void fish_color_parse(int argc, char **argv, FishColor *c) {
+    memset(c, 0, sizeof(*c));
+    for (int i = 0; i < argc; i++) {
+        const char *a = argv[i];
+        char buf[48];
+        if (strcmp(a, "--bold") == 0 || strcmp(a, "-o") == 0) c->bold = true;
+        else if (strcmp(a, "--underline") == 0 || strcmp(a, "-u") == 0 || strncmp(a, "--underline=", 12) == 0) c->underline = true;
+        else if (strcmp(a, "--italics") == 0 || strcmp(a, "-i") == 0) c->italics = true;
+        else if (strcmp(a, "--dim") == 0 || strcmp(a, "-d") == 0) c->dim = true;
+        else if (strcmp(a, "--reverse") == 0 || strcmp(a, "-r") == 0) c->reverse = true;
+        else if (strcmp(a, "--reset") == 0) c->reset = true;
+        else if (strncmp(a, "--background=", 13) == 0) { const char *n = fish_color_name(a + 13, buf, sizeof(buf)); if (n) snprintf(c->bg, sizeof(c->bg), "%s", n); }
+        else if ((strcmp(a, "-b") == 0 || strcmp(a, "--background") == 0) && i + 1 < argc) {
+            const char *n = fish_color_name(argv[++i], buf, sizeof(buf)); if (n) snprintf(c->bg, sizeof(c->bg), "%s", n);
+        }
+        else if (a[0] == '-') { /* --print-colors, -c ...: ignored */ }
+        else if (!c->fg[0]) {
+            const char *n = fish_color_name(a, buf, sizeof(buf));
+            if (n) { snprintf(c->fg, sizeof(c->fg), "%s", n); if (strcmp(a, "normal") == 0) c->reset = true; }
+        }
+    }
+}
+
+char *fish_color_ansi(int argc, char **argv) {
+    FishColor c;
+    fish_color_parse(argc, argv, &c);
+    dstr_t d; ds_init(&d);
+    if (c.reset) ds_append(&d, ANSI_RESET);
+    const char *attrs[][2] = { {"1", NULL}, {"4", NULL}, {"3", NULL}, {"2", NULL}, {"7", NULL} };
+    bool on[] = { c.bold, c.underline, c.italics, c.dim, c.reverse };
+    for (int i = 0; i < 5; i++) if (on[i]) { ds_append(&d, "\x1b["); ds_append(&d, attrs[i][0]); ds_append_c(&d, 'm'); }
+    if (c.fg[0] && strcmp(c.fg, "default") != 0) { char *code = ansi_code_for(c.fg); ds_append(&d, code); free(code); }
+    else if (c.fg[0] && !c.reset) ds_append(&d, "\x1b[39m");
+    if (c.bg[0]) {
+        char *code = ansi_code_for(c.bg);
+        /* foreground SGR -> background: 3x->4x, 9x->10x, 38;->48; */
+        dstr_t b; ds_init(&b);
+        for (char *p = code; *p; p++) {
+            bool start = p > code && (p[-1] == '[' || p[-1] == ';');
+            if (start && p[0] == '3' && p[1] == '8' && p[2] == ';') { ds_append(&b, "48"); p++; continue; }
+            if (start && p[0] == '3' && isdigit((unsigned char)p[1]) && (p[2] == 'm' || p[2] == ';')) { ds_append_c(&b, '4'); continue; }
+            if (start && p[0] == '9' && isdigit((unsigned char)p[1]) && (p[2] == 'm' || p[2] == ';')) { ds_append(&b, "10"); continue; }
+            ds_append_c(&b, *p);
+        }
+        ds_append(&d, b.data);
+        ds_free(&b);
+        free(code);
+    }
+    char *r = xstrdup(d.data);
+    ds_free(&d);
+    return r;
+}
+
+char *fish_color_to_spec(const char *value) {
+    strvec_t words; sv_init(&words);
+    char *copy = xstrdup(value);
+    for (char *save = NULL, *t = strtok_r(copy, " \t", &save); t; t = strtok_r(NULL, " \t", &save)) {
+        size_t n = strlen(t);
+        if (n >= 2 && (t[0] == '\'' || t[0] == '"') && t[n - 1] == t[0]) { t[n - 1] = '\0'; t++; }
+        sv_push_dup(&words, t);
+    }
+    free(copy);
+    FishColor c;
+    fish_color_parse((int)words.count, words.items, &c);
+    sv_free(&words);
+    dstr_t d; ds_init(&d);
+    if (c.bold) ds_append(&d, "bold-");
+    if (c.underline) ds_append(&d, "underline-");
+    if (c.italics) ds_append(&d, "italic-");
+    if (c.dim) ds_append(&d, "dim-");
+    if (c.reverse) ds_append(&d, "reverse-");
+    ds_append(&d, c.fg[0] ? c.fg : "default");
+    char *r = xstrdup(d.data);
+    ds_free(&d);
+    return r;
+}

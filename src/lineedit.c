@@ -22,6 +22,8 @@
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <poll.h>
+#include <time.h>
 
 static void wr(const char *s, size_t n) {
     while (n > 0) {
@@ -49,13 +51,13 @@ static void raw_on(void) {
     raw.c_oflag &= ~(unsigned)(OPOST);
     raw.c_cc[VMIN] = 1;
     raw.c_cc[VTIME] = 0;
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+    tcsetattr(STDIN_FILENO, TCSADRAIN, &raw);
     g_raw_active = true;
 }
 
 static void raw_off(void) {
     if (!g_raw_active) return;
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_orig_termios);
+    tcsetattr(STDIN_FILENO, TCSADRAIN, &g_orig_termios);
     g_raw_active = false;
 }
 
@@ -263,7 +265,7 @@ static size_t render_menu(LState *s, dstr_t *out, size_t W) {
                 ds_append_n(out, disp, k); ds_append(out, "…");
                 used = w + 1;
             } else { ds_append(out, disp); used = tw; }
-            if (cd->kind == CK_DIR) { ds_append_c(out, '/'); used++; }
+            if (cd->kind == CK_DIR && disp[0] && disp[strlen(disp) - 1] != '/') { ds_append_c(out, '/'); used++; }
             if (!selected) ds_append(out, ANSI_RESET);
             if (cd->desc && L.descs) {
                 size_t pad = L.textw + 2 > used ? L.textw + 2 - used : 1;
@@ -357,6 +359,24 @@ static void redraw_ex(LState *s, bool final) {
 }
 
 static void redraw(LState *s) { redraw_ex(s, false); }
+
+static char *g_left_override = NULL, *g_right_override = NULL;
+
+void lineedit_set_prompt_override(const char *left, const char *right) {
+    free(g_left_override); free(g_right_override);
+    g_left_override = left ? xstrdup(left) : NULL;
+    g_right_override = right ? xstrdup(right) : NULL;
+}
+
+static char *render_primary(const char *fmt) {
+    if (fmt && g_left_override) return xstrdup(g_left_override);
+    return fmt ? prompt_render(fmt) : prompt_render_continuation();
+}
+
+/* exposed for the `commandline` builtin (completion functions call it) */
+static LState *g_active = NULL;
+const char *lineedit_buffer(void) { return g_active && g_active->buf.data ? g_active->buf.data : ""; }
+size_t lineedit_cursor(void) { return g_active ? g_active->cursor : 0; }
 
 /* ---------- editing primitives ---------- */
 
@@ -805,6 +825,43 @@ static void print_prompt_head(const char *rendered, char **tail_out) {
     } else *tail_out = xstrdup(rendered);
 }
 
+/* is there unread input (type-ahead)? */
+static bool input_pending(void) {
+    struct pollfd pfd = { STDIN_FILENO, POLLIN, 0 };
+    return poll(&pfd, 1, 0) > 0;
+}
+
+/* Fade a new prompt in, from dim grey to its real colors, over a few
+ * frames. Skipped when keys are already waiting, so it never slows typing. */
+static void animate_prompt(const char *ptail) {
+    if (strcmp(config_get("prompt.animate", "yes"), "no") == 0) return;
+    const char *term = getenv("TERM");
+    if (!term || strcmp(term, "dumb") == 0) return;
+    long total_ms = atol(config_get("prompt.animate_ms", "60"));
+    if (total_ms <= 0) return;
+    /* the prompt's text without its colors */
+    dstr_t plain; ds_init(&plain);
+    for (const char *p = ptail; *p; p++) {
+        if (*p == 0x1b && p[1] == '[') { p += 2; while (*p && !(*p >= 0x40 && *p <= 0x7e)) p++; if (!*p) break; continue; }
+        ds_append_c(&plain, *p);
+    }
+    static const int shades[] = { 237, 240, 244, 248 };
+    int frames = (int)(sizeof(shades) / sizeof(shades[0]));
+    struct timespec ts = { 0, (total_ms * 1000000L) / frames };
+    for (int i = 0; i < frames; i++) {
+        if (input_pending()) break;
+        char frame[64];
+        snprintf(frame, sizeof(frame), "\x1b[?25l\r\x1b[38;5;%dm", shades[i]);
+        dstr_t out; ds_init(&out);
+        ds_append(&out, frame); ds_append(&out, plain.data); ds_append(&out, "\x1b[0m\x1b[K");
+        wr(out.data, out.len);
+        ds_free(&out);
+        nanosleep(&ts, NULL);
+    }
+    wrs("\x1b[?25h");
+    ds_free(&plain);
+}
+
 static char *read_plain_line(void) {
     dstr_t buf; ds_init(&buf);
     int c; bool any = false;
@@ -822,7 +879,7 @@ static char *read_plain_line(void) {
 char *lineedit_read(const char *prompt_fmt) {
     if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) return read_plain_line();
 
-    char *prompt_rendered = prompt_fmt ? prompt_render(prompt_fmt) : prompt_render_continuation();
+    char *prompt_rendered = render_primary(prompt_fmt);
 
     raw_on();
     LState s; memset(&s, 0, sizeof(s));
@@ -830,13 +887,16 @@ char *lineedit_read(const char *prompt_fmt) {
     sv_init(&s.undo);
     s.sel = -1;
     const char *rfmt = config_get("rprompt", "");
-    s.rprompt = (prompt_fmt && rfmt && *rfmt) ? prompt_render(rfmt) : NULL;
+    if (prompt_fmt && g_left_override) s.rprompt = g_right_override ? xstrdup(g_right_override) : NULL;
+    else s.rprompt = (prompt_fmt && rfmt && *rfmt) ? prompt_render(rfmt) : NULL;
     if (s.rprompt && display_width(s.rprompt) == 0) { free(s.rprompt); s.rprompt = NULL; }
 
     if (prompt_fmt) prompt_sp();
     print_prompt_head(prompt_rendered, &s.ptail);
+    if (prompt_fmt) animate_prompt(s.ptail);
     bool eof = false;
     int last_key = 0;
+    g_active = &s;
 
     redraw(&s);
 
@@ -879,7 +939,7 @@ char *lineedit_read(const char *prompt_fmt) {
                 hist_reset(&s);
                 s.cur_row = 0;
                 {
-                    char *fresh = prompt_fmt ? prompt_render(prompt_fmt) : prompt_render_continuation();
+                    char *fresh = render_primary(prompt_fmt);
                     free(s.ptail);
                     print_prompt_head(fresh, &s.ptail);
                     free(fresh);
@@ -894,7 +954,7 @@ char *lineedit_read(const char *prompt_fmt) {
             case 12: /* Ctrl-L */
                 wrs("\x1b[H\x1b[2J");
                 {
-                    char *fresh = prompt_fmt ? prompt_render(prompt_fmt) : prompt_render_continuation();
+                    char *fresh = render_primary(prompt_fmt);
                     free(s.ptail);
                     print_prompt_head(fresh, &s.ptail);
                     free(fresh);
@@ -1046,6 +1106,7 @@ char *lineedit_read(const char *prompt_fmt) {
         last_key = key;
     }
 
+    g_active = NULL;
     menu_close(&s);
     raw_off();
     hist_reset(&s);

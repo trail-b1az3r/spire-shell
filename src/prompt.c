@@ -57,6 +57,33 @@ static void append_git_status(dstr_t *out) {
     ds_append(out, ") ");
 }
 
+/* just the branch name (or a short hash when detached), "" outside a repo */
+static void append_branch_name(dstr_t *out) {
+    FILE *f = popen("git symbolic-ref --short HEAD 2>/dev/null || git rev-parse --short HEAD 2>/dev/null", "r");
+    if (!f) return;
+    char b[256];
+    if (fgets(b, sizeof(b), f)) {
+        size_t n = strlen(b);
+        while (n && (b[n-1] == '\n' || b[n-1] == '\r')) b[--n] = '\0';
+        ds_append(out, b);
+    }
+    pclose(f);
+}
+
+static bool in_git_repo(void) {
+    /* walk up looking for .git: cheaper than running git */
+    char dir[4096];
+    if (!getcwd(dir, sizeof(dir))) return false;
+    for (;;) {
+        char probe[4200];
+        snprintf(probe, sizeof(probe), "%s/.git", dir);
+        if (access(probe, F_OK) == 0) return true;
+        char *sl = strrchr(dir, '/');
+        if (!sl || sl == dir) { snprintf(probe, sizeof(probe), "/.git"); return access(probe, F_OK) == 0; }
+        *sl = '\0';
+    }
+}
+
 static void append_duration(dstr_t *out) {
     long ms = g_last_duration_ms;
     long threshold = atol(config_get("prompt.duration_threshold", "2000"));
@@ -107,6 +134,7 @@ static void render_conditional(const char **pp, dstr_t *out) {
     switch (cond) {
         case '?': truth = last_status() == 0; break;
         case 'j': truth = jobs_count() > 0; break;
+        case 'g': truth = in_git_repo(); break;
         case '#': truth = getuid() == 0; break;
         default: truth = isdigit((unsigned char)cond) ? last_status() == cond - '0' : false; break;
     }
@@ -227,6 +255,7 @@ static void render_into(const char *fmt, dstr_t *outp) {
             case 'J': { int n = jobs_count(); if (n) { char b[32]; snprintf(b, sizeof(b), "✦%d ", n); ds_append(&out, b); } p++; break; }
             case 'c': append_duration(&out); p++; break;
             case 'G': append_git_status(&out); p++; break;
+            case 'r': if (in_git_repo()) append_branch_name(&out); p++; break;
             case 'h': { char b[24]; snprintf(b, sizeof(b), "%zu", history_count() + 1); ds_append(&out, b); p++; break; }
             case 'M': { char host[256]; if (gethostname(host, sizeof(host)) == 0) ds_append(&out, host); p++; break; }
             case '/': { char cwd[4096]; if (getcwd(cwd, sizeof(cwd))) ds_append(&out, cwd); p++; break; }

@@ -5,10 +5,10 @@
 
 #define CFG_BUCKETS 128
 
-/* fish's look: user@host ~/s/dir (branch) [status]>  -- see `colorscheme spire` for the old one */
-#define DEFAULT_PROMPT "%F{brightgreen}%n%f@%m %(#.%F{red}.%F{green})%P%f %G%(?..%F{red}[%?]%f )%(#.#.>) "
-/* fish has no right prompt by default */
-#define DEFAULT_RPROMPT ""
+/* user ❯ (input) ... branch: the ❯ turns red after a failure, the git branch shows on the right */
+#define DEFAULT_PROMPT "%F{brightgreen}%n%f %(?.%F{green}.%F{red})❯%f "
+/* the git branch, only inside a repository */
+#define DEFAULT_RPROMPT "%(g.%F{magenta}%r%f.)"
 
 typedef struct CfgEntry {
     char *key;
@@ -167,8 +167,8 @@ void config_load_default(void) {
         if (f) {
             fprintf(f,
                 "# spire configuration - see `man spire` / README for the full key list\n"
-                "prompt = \"%%F{brightgreen}%%n%%f@%%m %%(#.%%F{red}.%%F{green})%%P%%f %%G%%(?..%%F{red}[%%?]%%f )%%(#.#.>) \"\n"
-                "rprompt = \"\"\n"
+                "prompt = \"%%F{brightgreen}%%n%%f %%(?.%%F{green}.%%F{red})❯%%f \"\n"
+                "rprompt = \"%%(g.%%F{magenta}%%r%%f.)\"\n"
                 "# fish's default theme (run `colorscheme` to see all colors)\n"
                 "colorscheme = fish\n"
                 "history.size = 5000\n"

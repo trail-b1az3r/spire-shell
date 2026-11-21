@@ -21,6 +21,7 @@
 #include "lexer.h"
 #include "jobs.h"
 #include "config.h"
+#include "fishfuncs.h"
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -1231,6 +1232,7 @@ void complete_line(const char *line, size_t cursor, Completion *res) {
             goto filter;
         }
         bool want_files = true;
+        fish_autoload_completion(ctx.cmd);
         if (rules_exist_for(ctx.cmd) && apply_rules(&ctx, word, line, &all, &want_files)) {
             if (word[0] == '-' && all.count == 0) add_help_options(ctx.cmd, &all);
             if (want_files && word[0] != '-') add_files(word, &all, false);

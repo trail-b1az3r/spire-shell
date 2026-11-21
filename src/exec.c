@@ -26,6 +26,7 @@
 #include "highlight.h"
 #include "complete.h"
 #include "config.h"
+#include "fishfuncs.h"
 
 int g_exec_depth = 0;
 volatile bool g_should_exit = false;
@@ -204,6 +205,7 @@ char *exec_procsub(const char *src, bool want_read) {
         if (want_read) { dup2(pfd[1], STDOUT_FILENO); }
         else { dup2(pfd[0], STDIN_FILENO); }
         close(pfd[0]); close(pfd[1]);
+        g_shell_is_interactive = false;
         g_exec_depth++;
         int st = exec_source_string(src);
         flush_exit(st);
@@ -763,6 +765,8 @@ static int exec_simple_command(Node *n) {
     apply_env_assigns(&n->env_assigns, &saved, &nsaved);
 
     int status;
+    if (func_get(argv.items[0]) == NULL && builtin_lookup(argv.items[0]) == NULL && !strchr(argv.items[0], '/'))
+        fish_autoload_function(argv.items[0]); /* fish: functions/NAME.fish */
     bool is_ext = func_get(argv.items[0]) == NULL && builtin_lookup(argv.items[0]) == NULL;
 
     if (is_ext && !command_exists(argv.items[0])) {
@@ -839,11 +843,23 @@ static int exec_pipeline(Node *n) {
     pid_t pgid = 0;
     fflush(NULL);
 
-    for (size_t i = 0; i < k; i++) {
+    /* like fish and zsh, a trailing builtin/function runs in the shell
+     * itself, so `cmd | source`, `cmd | read x` and `cmd | set` keep their
+     * effect */
+    Node *last = n->children[k - 1];
+    bool lastpipe = false;
+    if (last->type == N_CMD && last->argv.count > 0 && !is_arith_cmd(last) && !strpbrk(last->argv.items[0], "$`'\"\\(")) {
+        const char *w = last->argv.items[0];
+        lastpipe = !alias_get(w) && (builtin_lookup(w) != NULL || func_get(w) != NULL);
+    }
+    size_t nfork = lastpipe ? k - 1 : k;
+
+    for (size_t i = 0; i < nfork; i++) {
         pid_t pid = fork();
         if (pid == 0) {
             setpgid(0, pgid); /* first stage: pgid==0 -> becomes its own leader */
             reset_child_signals();
+            g_shell_is_interactive = false; /* no job control inside a stage */
             if (i > 0) dup2(pipes[i - 1][0], STDIN_FILENO);
             if (i < k - 1) {
                 dup2(pipes[i][1], STDOUT_FILENO);
@@ -857,13 +873,22 @@ static int exec_pipeline(Node *n) {
         setpgid(pid, pgid);
         pids[i] = pid;
     }
-    for (size_t j = 0; j < k - 1; j++) { close(pipes[j][0]); close(pipes[j][1]); }
+    int *sts = xmalloc(sizeof(int) * k);
+    if (lastpipe) {
+        int saved_in = fcntl(STDIN_FILENO, F_DUPFD_CLOEXEC, 10);
+        dup2(pipes[k - 2][0], STDIN_FILENO);
+        for (size_t j = 0; j < k - 1; j++) { close(pipes[j][0]); close(pipes[j][1]); }
+        sts[k - 1] = exec_simple_command(last);
+        fflush(stdout);
+        if (saved_in >= 0) { dup2(saved_in, STDIN_FILENO); close(saved_in); }
+    } else {
+        for (size_t j = 0; j < k - 1; j++) { close(pipes[j][0]); close(pipes[j][1]); }
+    }
     procsub_cleanup();
 
-    if (g_shell_is_interactive) tcsetpgrp(STDIN_FILENO, pgid);
-    int *sts = xmalloc(sizeof(int) * k);
+    if (g_shell_is_interactive && !lastpipe) tcsetpgrp(STDIN_FILENO, pgid);
     bool stopped = false;
-    for (size_t i = 0; i < k; i++) {
+    for (size_t i = 0; i < nfork; i++) {
         int st;
         while (waitpid(pids[i], &st, WUNTRACED) < 0 && errno == EINTR) {}
         if (WIFSTOPPED(st)) { stopped = true; sts[i] = 128 + WSTOPSIG(st); }
@@ -1244,6 +1269,7 @@ int exec_capture_stdout(const char *src, char **out_buf) {
         dup2(pfd[1], STDOUT_FILENO);
         close(pfd[1]);
         signal(SIGINT, SIG_DFL);
+        g_shell_is_interactive = false;
         g_exec_depth++;
         int st = exec_source_string(src);
         flush_exit(st);
@@ -1315,3 +1341,38 @@ static char *node_to_string(Node *n) {
     ds_free(&d);
     return r;
 }
+
+/* ---------- fish events ---------- */
+
+static void emit_hook(const char *tag, const char *name, int argc, char **argv) {
+    static int depth = 0;
+    if (depth > 4) return;
+    strvec_t names; sv_init(&names);
+    func_list_names(&names);
+    dstr_t want; ds_init(&want);
+    ds_append(&want, tag); ds_append(&want, name);
+    for (size_t i = 0; i < names.count; i++) {
+        Node *fn = func_get(names.items[i]);
+        if (!fn) continue;
+        bool hit = false;
+        for (size_t k = 0; k < fn->argv.count; k++) if (strcmp(fn->argv.items[k], want.data) == 0) hit = true;
+        if (!hit) continue;
+        strvec_t av; sv_init(&av);
+        sv_push_dup(&av, names.items[i]);
+        if (strcmp(tag, "var:") == 0) { sv_push_dup(&av, "VARIABLE"); sv_push_dup(&av, "SET"); sv_push_dup(&av, name); }
+        else { for (int a = 0; a < argc; a++) sv_push_dup(&av, argv[a]); }
+        char **c = sv_to_argv(&av);
+        int saved = g_exit_code;
+        depth++;
+        exec_call_function(fn, (int)av.count, c);
+        depth--;
+        set_status(saved);
+        free(c);
+        sv_free(&av);
+    }
+    ds_free(&want);
+    sv_free(&names);
+}
+
+void exec_emit_event(const char *name, int argc, char **argv) { emit_hook("event:", name, argc, argv); }
+void exec_emit_var(const char *name) { emit_hook("var:", name, 0, NULL); }

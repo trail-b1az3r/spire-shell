@@ -14,6 +14,7 @@
 #include "history.h"
 #include "highlight.h"
 #include "config.h"
+#include "lineedit.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -242,6 +243,18 @@ static int b_set(int argc, char **argv) {
     }
 
     bool exp = (exported || var_is_exported(name)) && !unexport;
+    size_t nl = strlen(name);
+    if (nl >= 4 && strcmp(name + nl - 4, "PATH") == 0 && vals.count != 1) {
+        /* fish keeps PATH-like variables as lists but exports them joined
+         * by ':'; spire stores the joined form so bash code keeps working */
+        dstr_t d; ds_init(&d);
+        for (size_t k = 0; k < vals.count; k++) { if (!vals.items[k][0]) continue; if (d.len) ds_append_c(&d, ':'); ds_append(&d, vals.items[k]); }
+        array_unset(name);
+        var_set(name, d.data, exp);
+        ds_free(&d);
+        sv_free(&vals);
+        return 0;
+    }
     if (vals.count == 1 || (vals.count == 0 && !array_exists(name))) {
         array_unset(name);
         if (unexport) var_unset(name);
@@ -824,14 +837,27 @@ static int path_lookup(const char *name, strvec_t *out, bool all) {
 }
 
 static int b_type(int argc, char **argv) {
-    bool type_only = false, all = false, path_only = false;
+    bool type_only = false, all = false, path_only = false, quiet = false;
     int i = 1;
     for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+        if (strcmp(argv[i], "--query") == 0) { quiet = true; continue; }
+        if (strcmp(argv[i], "--type") == 0) { type_only = true; continue; }
         for (const char *p = argv[i] + 1; *p; p++) {
-            if (*p == 't') type_only = true;
+            if (*p == 'q') quiet = true;
+            else if (*p == 't') type_only = true;
             else if (*p == 'a') all = true;
             else if (*p == 'p' || *p == 'P') path_only = true;
         }
+    }
+    if (quiet) {
+        /* fish `type -q`: does any kind of command by this name exist? */
+        for (; i < argc; i++) {
+            strvec_t paths; sv_init(&paths);
+            bool ok = alias_get(argv[i]) || func_get(argv[i]) || builtin_exists(argv[i]) || is_keyword(argv[i]) || path_lookup(argv[i], &paths, false);
+            sv_free(&paths);
+            if (!ok) return 1;
+        }
+        return 0;
     }
     int status = 0;
     bool c = out_color();
@@ -984,7 +1010,16 @@ static int b_isatty(int argc, char **argv) {
 }
 
 static int b_source(int argc, char **argv) {
-    if (argc < 2) { sh_err("source: filename required\n"); return 2; }
+    if (argc < 2 || strcmp(argv[1], "-") == 0) {
+        /* `cmd | source` (fish, and zsh/bash with /dev/stdin): run stdin */
+        if (argc < 2 && isatty(STDIN_FILENO)) { sh_err("source: filename required\n"); return 2; }
+        dstr_t buf; ds_init(&buf);
+        char chunk[4096]; ssize_t r;
+        while ((r = read(STDIN_FILENO, chunk, sizeof(chunk))) > 0) ds_append_n(&buf, chunk, (size_t)r);
+        int st = exec_eval_string(buf.data);
+        ds_free(&buf);
+        return st;
+    }
     const char *file = argv[1];
     char found[4096];
     if (!strchr(file, '/') && access(file, R_OK) != 0) {
@@ -1408,6 +1443,17 @@ static int b_contains(int argc, char **argv) {
     if (i < argc && strcmp(argv[i], "--") == 0) i++;
     if (i >= argc) return 1;
     const char *needle = argv[i++];
+    if (argc - i == 1 && strchr(argv[i], ':') && !strchr(needle, ':')) {
+        /* a joined PATH-like value: check its parts (fish sees a list) */
+        char *copy = xstrdup(argv[i]);
+        int idx = 0;
+        for (char *save = NULL, *t = strtok_r(copy, ":", &save); t; t = strtok_r(NULL, ":", &save)) {
+            idx++;
+            if (strcmp(t, needle) == 0) { if (print_index) printf("%d\n", idx); free(copy); return 0; }
+        }
+        free(copy);
+        return 1;
+    }
     for (int k = i; k < argc; k++) {
         if (strcmp(argv[k], needle) == 0) { if (print_index) printf("%d\n", k - i + 1); return 0; }
     }
@@ -1428,6 +1474,19 @@ static int b_random(int argc, char **argv) {
 
 static int b_status(int argc, char **argv) {
     const char *sub = argc > 1 ? argv[1] : "";
+    if (strncmp(sub, "--", 2) == 0 && strncmp(sub, "--is-", 5) == 0) sub += 2; /* fish's old --is-x spelling */
+    if (strcmp(sub, "is-full-job-control") == 0 || strcmp(sub, "is-interactive-job-control") == 0) return g_shell_is_interactive ? 0 : 1;
+    if (strcmp(sub, "is-no-job-control") == 0) return g_shell_is_interactive ? 1 : 0;
+    if (strcmp(sub, "is-block") == 0) return 1;
+    if (strcmp(sub, "is-breakpoint") == 0) return 1;
+    if (strcmp(sub, "job-control") == 0 || strcmp(sub, "features") == 0 || strcmp(sub, "test-feature") == 0) return 0;
+    if (strcmp(sub, "current-function") == 0) { printf("%s\n", var_get("0") ? var_get("0") : "Not a function"); return 0; }
+    if (strcmp(sub, "line-number") == 0 || strcmp(sub, "current-line-number") == 0) { printf("0\n"); return 0; }
+    if (strcmp(sub, "dirname") == 0 || strcmp(sub, "current-dirname") == 0) {
+        const char *z = var_get("0"); char *d = xstrdup(z ? z : "."); char *sl = strrchr(d, '/');
+        if (sl) *sl = '\0'; else strcpy(d, ".");
+        printf("%s\n", d); free(d); return 0;
+    }
     if (strcmp(sub, "is-interactive") == 0 || strcmp(sub, "-i") == 0) return g_shell_is_interactive ? 0 : 1;
     if (strcmp(sub, "is-login") == 0 || strcmp(sub, "-l") == 0) { const char *z = var_get("0"); return (z && z[0] == '-') ? 0 : 1; }
     if (strcmp(sub, "is-command-substitution") == 0) return g_exec_depth > 0 ? 0 : 1;
@@ -1462,6 +1521,22 @@ static int b_string(int argc, char **argv) {
     if (argc < 2) { sh_err("string: missing subcommand\n"); return 2; }
     const char *sub = argv[1];
     int i = 2;
+    /* `--` ends the options: drop it (only when every earlier arg is an option) */
+    char **av2 = xmalloc(sizeof(char *) * (size_t)(argc + 1));
+    int ac2 = 0;
+    bool dropped = false;
+    for (int k = 0; k < argc; k++) {
+        if (!dropped && k >= 2 && strcmp(argv[k], "--") == 0) {
+            bool opts_only = true;
+            for (int q = 2; q < k; q++) if (argv[q][0] != '-') opts_only = false;
+            /* options that take a value (-n N, -m N, -s N ...) */
+            if (opts_only) { dropped = true; continue; }
+        }
+        av2[ac2++] = argv[k];
+    }
+    av2[ac2] = NULL;
+    argv = av2;
+    argc = ac2;
     strvec_t in; sv_init(&in);
     int status = 1;
 
@@ -1511,8 +1586,12 @@ static int b_string(int argc, char **argv) {
     } else if (strcmp(sub, "split") == 0) {
         long max = -1;
         bool right = false, no_empty = false;
+        const char *fields = NULL;
         for (;;) {
-            if (i + 1 < argc && (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--max") == 0)) { max = atol(argv[i + 1]); i += 2; }
+            if (i + 1 < argc && (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--fields") == 0)) { fields = argv[i + 1]; i += 2; }
+            else if (strncmp(argv[i < argc ? i : 0], "-f", 2) == 0 && i < argc && isdigit((unsigned char)argv[i][2])) { fields = argv[i] + 2; i++; }
+            else if (i < argc && strncmp(argv[i], "--fields=", 9) == 0) { fields = argv[i] + 9; i++; }
+            else if (i + 1 < argc && (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--max") == 0)) { max = atol(argv[i + 1]); i += 2; }
             else if (has_flag(&i, argc, argv, "-r", "--right")) right = true;
             else if (has_flag(&i, argc, argv, "-n", "--no-empty")) no_empty = true;
             else break;
@@ -1549,6 +1628,17 @@ static int b_string(int argc, char **argv) {
                 sv_free(&rev);
             }
             if (parts.count > 1) status = 0;
+            if (fields) {
+                /* -f 1,3 or -f 2-4 (1-based) */
+                char *fc = xstrdup(fields);
+                for (char *s2 = NULL, *f = strtok_r(fc, ",", &s2); f; f = strtok_r(NULL, ",", &s2)) {
+                    long a = atol(f), b = a;
+                    char *dash = strchr(f, '-');
+                    if (dash) b = atol(dash + 1);
+                    for (long q = a; q <= b; q++) if (q >= 1 && (size_t)q <= parts.count) printf("%s\n", parts.items[q - 1]);
+                }
+                free(fc);
+            } else
             for (size_t q = 0; q < parts.count; q++) if (!no_empty || parts.items[q][0]) printf("%s\n", parts.items[q]);
             sv_free(&parts);
         }
@@ -1706,6 +1796,7 @@ static int b_string(int argc, char **argv) {
         status = 2;
     }
     sv_free(&in);
+    free(av2);
     fflush(stdout);
     return status;
 }
@@ -1996,6 +2087,239 @@ static int b_help(int argc, char **argv) {
     return 0;
 }
 
+
+/* =========================== fish compatibility =========================== */
+
+static int b_emit(int argc, char **argv) {
+    if (argc < 2) { sh_err("emit: expected an event name\n"); return 2; }
+    exec_emit_event(argv[1], argc - 2, argv + 2);
+    return 0;
+}
+
+/* key bindings: accepted so configs load; spire's own keys stay in effect */
+static strvec_t g_binds;
+static int b_bind(int argc, char **argv) {
+    static bool init = false;
+    if (!init) { sv_init(&g_binds); init = true; }
+    if (argc == 1 || (argc == 2 && (strcmp(argv[1], "-a") == 0 || strcmp(argv[1], "--all") == 0))) {
+        for (size_t i = 0; i < g_binds.count; i++) printf("bind %s\n", g_binds.items[i]);
+        return 0;
+    }
+    if (strcmp(argv[1], "-L") == 0 || strcmp(argv[1], "--list-modes") == 0) { printf("default\n"); return 0; }
+    if (strcmp(argv[1], "-f") == 0 || strcmp(argv[1], "--function-names") == 0) return 0;
+    if (strcmp(argv[1], "-K") == 0 || strcmp(argv[1], "--key-names") == 0) return 0;
+    dstr_t d; ds_init(&d);
+    for (int i = 1; i < argc; i++) { if (i > 1) ds_append_c(&d, ' '); ds_append(&d, argv[i]); }
+    sv_push(&g_binds, xstrdup(d.data));
+    ds_free(&d);
+    return 0;
+}
+
+/* commandline: the line being edited (for completions and bindings) */
+static int b_commandline(int argc, char **argv) {
+    const char *buf = lineedit_buffer();
+    size_t cursor = lineedit_cursor();
+    bool tokens = false, cut = false, current_token = false, cursor_q = false;
+    int i = 1;
+    for (; i < argc && argv[i][0] == '-'; i++) {
+        const char *a = argv[i];
+        if (a[1] == '-') {
+            if (!strcmp(a, "--tokenize") || !strcmp(a, "--tokens-expanded") || !strcmp(a, "--tokens-raw")) tokens = true;
+            else if (!strcmp(a, "--cut-at-cursor")) cut = true;
+            else if (!strcmp(a, "--current-token")) current_token = true;
+            else if (!strcmp(a, "--cursor")) cursor_q = true;
+            continue;
+        }
+        for (const char *p = a + 1; *p; p++) {
+            if (*p == 'o' || *p == 'x') tokens = true;
+            else if (*p == 'c') cut = true;
+            else if (*p == 't') current_token = true;
+            else if (*p == 'C') cursor_q = true;
+        }
+    }
+    if (cursor_q) { printf("%zu\n", cursor); return 0; }
+    if (i < argc) return 0; /* setting the command line isn't supported */
+    size_t end = cut ? cursor : strlen(buf);
+    char *text = xstrndup(buf, end);
+    /* only the current command (after the last ; | & ) */
+    char *seg = text;
+    for (char *p = text; *p; p++) if (*p == ';' || *p == '|' || *p == '&') seg = p + 1;
+    if (current_token) {
+        char *t = seg + strlen(seg);
+        while (t > seg && !isspace((unsigned char)t[-1])) t--;
+        printf("%s\n", t);
+    } else if (tokens) {
+        char *copy = xstrdup(seg);
+        size_t n = strlen(copy);
+        bool trailing_space = cut && n && isspace((unsigned char)copy[n - 1]);
+        strvec_t words; sv_init(&words);
+        for (char *save = NULL, *w = strtok_r(copy, " \t", &save); w; w = strtok_r(NULL, " \t", &save)) sv_push_dup(&words, w);
+        /* -c drops the token under the cursor */
+        size_t upto = (cut && !trailing_space && words.count) ? words.count - 1 : words.count;
+        for (size_t k = 0; k < upto; k++) printf("%s\n", words.items[k]);
+        sv_free(&words);
+        free(copy);
+    } else printf("%s\n", text);
+    free(text);
+    return 0;
+}
+
+/* psub: stdin into a temporary file whose path is printed: source (cmd | psub) */
+static int b_psub(int argc, char **argv) {
+    const char *suffix = "";
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], "-s") || !strcmp(argv[i], "--suffix")) suffix = argv[i + 1];
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/spire-psub-XXXXXX%s", suffix);
+    int fd = mkstemps(path, (int)strlen(suffix));
+    if (fd < 0) { sh_err("psub: %s\n", strerror(errno)); return 1; }
+    char chunk[4096]; ssize_t r;
+    while ((r = read(STDIN_FILENO, chunk, sizeof(chunk))) > 0) { ssize_t w = write(fd, chunk, (size_t)r); (void)w; }
+    close(fd);
+    printf("%s\n", path);
+    return 0;
+}
+
+/* fish_add_path [-g|-U] [-a|-p] [-m] [-P] [-v] DIR...: add existing dirs to $PATH */
+static int b_fish_add_path(int argc, char **argv) {
+    bool append = false, move = false, verbose = false, path_only = false;
+    int i = 1;
+    for (; i < argc && argv[i][0] == '-'; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "--")) { i++; break; }
+        if (!strcmp(a, "--append")) append = true;
+        else if (!strcmp(a, "--prepend")) append = false;
+        else if (!strcmp(a, "--move")) move = true;
+        else if (!strcmp(a, "--verbose")) verbose = true;
+        else if (!strcmp(a, "--path")) path_only = true;
+        else if (a[1] != '-') for (const char *p = a + 1; *p; p++) {
+            if (*p == 'a') append = true; else if (*p == 'p') append = false;
+            else if (*p == 'm') move = true; else if (*p == 'v') verbose = true; else if (*p == 'P') path_only = true;
+        }
+    }
+    (void)path_only;
+    const char *cur = var_get("PATH");
+    strvec_t parts; sv_init(&parts);
+    if (cur) { char *c = xstrdup(cur); for (char *save = NULL, *t = strtok_r(c, ":", &save); t; t = strtok_r(NULL, ":", &save)) sv_push_dup(&parts, t); free(c); }
+    strvec_t add; sv_init(&add);
+    int changed = 0;
+    for (; i < argc; i++) {
+        char real[4096];
+        const char *d = argv[i];
+        if (!realpath(d, real)) continue;
+        struct stat st;
+        if (stat(real, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        int at = -1;
+        for (size_t k = 0; k < parts.count; k++) if (!strcmp(parts.items[k], real) || !strcmp(parts.items[k], d)) at = (int)k;
+        if (at >= 0 && !move) continue;
+        if (at >= 0) { free(parts.items[at]); memmove(parts.items + at, parts.items + at + 1, sizeof(char *) * (parts.count - (size_t)at - 1)); parts.count--; }
+        sv_push_dup(&add, real);
+        changed++;
+        if (verbose) printf("fish_add_path: %s\n", real);
+    }
+    if (!changed) { sv_free(&parts); sv_free(&add); return 1; }
+    dstr_t d; ds_init(&d);
+    strvec_t *first = append ? &parts : &add, *second = append ? &add : &parts;
+    for (size_t k = 0; k < first->count; k++) { if (d.len) ds_append_c(&d, ':'); ds_append(&d, first->items[k]); }
+    for (size_t k = 0; k < second->count; k++) { if (d.len) ds_append_c(&d, ':'); ds_append(&d, second->items[k]); }
+    var_set("PATH", d.data, true);
+    ds_free(&d); sv_free(&parts); sv_free(&add);
+    return 0;
+}
+
+/* prompt_pwd [-d N] [-D N]: fish's shortened working directory */
+static int b_prompt_pwd(int argc, char **argv) {
+    int keep_chars = 1, full = 1;
+    const char *dl = var_get("fish_prompt_pwd_dir_length");
+    if (dl) keep_chars = atoi(dl);
+    const char *fl = var_get("fish_prompt_pwd_full_dirs");
+    if (fl) full = atoi(fl);
+    int i = 1;
+    for (; i < argc; i++) {
+        if ((!strcmp(argv[i], "-d") || !strcmp(argv[i], "--dir-length")) && i + 1 < argc) keep_chars = atoi(argv[++i]);
+        else if ((!strcmp(argv[i], "-D") || !strcmp(argv[i], "--full-length-dirs")) && i + 1 < argc) full = atoi(argv[++i]);
+        else if (!strncmp(argv[i], "--dir-length=", 13)) keep_chars = atoi(argv[i] + 13);
+        else break;
+    }
+    char cwd[4096];
+    const char *src = i < argc ? argv[i] : (getcwd(cwd, sizeof(cwd)) ? cwd : "?");
+    dstr_t path; ds_init(&path);
+    const char *home = var_get("HOME");
+    size_t hl = home ? strlen(home) : 0;
+    if (hl > 1 && !strncmp(src, home, hl) && (src[hl] == '/' || !src[hl])) { ds_append_c(&path, '~'); ds_append(&path, src + hl); }
+    else ds_append(&path, src);
+    strvec_t comps; sv_init(&comps);
+    bool abs = path.data[0] == '/';
+    char *c = xstrdup(path.data);
+    for (char *save = NULL, *t = strtok_r(c, "/", &save); t; t = strtok_r(NULL, "/", &save)) sv_push_dup(&comps, t);
+    free(c);
+    dstr_t out; ds_init(&out);
+    if (abs) ds_append_c(&out, '/');
+    for (size_t k = 0; k < comps.count; k++) {
+        const char *w = comps.items[k];
+        bool keep_full = keep_chars <= 0 || (int)(comps.count - k) <= (full < 1 ? 1 : full) || !strcmp(w, "~");
+        if (k) ds_append_c(&out, '/');
+        if (keep_full) ds_append(&out, w);
+        else {
+            size_t n = (size_t)keep_chars + (w[0] == '.' ? 1 : 0);
+            /* keep whole UTF-8 characters */
+            size_t bytes = 0, chars = 0;
+            while (w[bytes] && chars < n) { bytes++; while (w[bytes] && ((unsigned char)w[bytes] & 0xC0) == 0x80) bytes++; chars++; }
+            ds_append_n(&out, w, bytes);
+        }
+    }
+    if (!out.len) ds_append_c(&out, '/');
+    printf("%s\n", out.data);
+    ds_free(&out); ds_free(&path); sv_free(&comps);
+    return 0;
+}
+
+static char *git_branch_name(void) {
+    char *out = NULL;
+    exec_capture_stdout("command git symbolic-ref --short HEAD 2>/dev/null; or command git rev-parse --short HEAD 2>/dev/null", &out);
+    if (out && !*out) { free(out); return NULL; }
+    return out;
+}
+
+/* fish_vcs_prompt / fish_git_prompt [FORMAT]: " (branch)" in a git repo */
+static int b_fish_git_prompt(int argc, char **argv) {
+    char *b = git_branch_name();
+    if (!b) return 1;
+    const char *fmt = argc > 1 ? argv[1] : " (%s)";
+    printf(fmt, b);
+    free(b);
+    fflush(stdout);
+    return 0;
+}
+
+static int b_fish_is_root_user(int argc, char **argv) { (void)argc; (void)argv; return geteuid() == 0 ? 0 : 1; }
+
+static int b_prompt_hostname(int argc, char **argv) {
+    (void)argc; (void)argv;
+    char host[256];
+    if (gethostname(host, sizeof(host)) != 0) return 1;
+    char *dot = strchr(host, '.');
+    if (dot) *dot = '\0';
+    printf("%s\n", host);
+    return 0;
+}
+
+static int b_prompt_login(int argc, char **argv) {
+    (void)argc; (void)argv;
+    const char *u = var_get("USER");
+    char host[256] = "";
+    gethostname(host, sizeof(host));
+    char *dot = strchr(host, '.');
+    if (dot) *dot = '\0';
+    printf("%s%s\x1b[0m@%s\n", "\x1b[32m", u ? u : "?", host);
+    return 0;
+}
+
+static int b_funcsave(int argc, char **argv) {
+    (void)argc; (void)argv;
+    sh_err("funcsave: spire doesn't save functions; put them in ~/.config/spire/config.spire\n");
+    return 1;
+}
+
 /* =========================== table =========================== */
 
 static BuiltinEntry g_extra[] = {
@@ -2013,6 +2337,11 @@ static BuiltinEntry g_extra[] = {
     {"count", b_count}, {"contains", b_contains}, {"random", b_random}, {"status", b_status},
     {"string", b_string}, {"math", b_math}, {"abbr", b_abbr},
     {"help", b_help},
+    {"emit", b_emit}, {"bind", b_bind}, {"commandline", b_commandline}, {"psub", b_psub},
+    {"fish_add_path", b_fish_add_path}, {"prompt_pwd", b_prompt_pwd},
+    {"fish_vcs_prompt", b_fish_git_prompt}, {"fish_git_prompt", b_fish_git_prompt}, {"__fish_git_prompt", b_fish_git_prompt},
+    {"fish_is_root_user", b_fish_is_root_user}, {"prompt_hostname", b_prompt_hostname}, {"prompt_login", b_prompt_login},
+    {"funcsave", b_funcsave},
     {NULL, NULL}
 };
 
