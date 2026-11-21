@@ -17,6 +17,9 @@ const char *config_history_path(void);
 const char *config_module_dir(void);
 strvec_t *config_modules(void); /* enabled module names, do not free */
 
-const char *config_dir(void);   /* ~/.config/spire */
+const char *config_dir(void);
+
+/* called for `colorscheme = NAME` lines, in file order (set by main) */
+extern void (*config_scheme_hook)(const char *name);   /* ~/.config/spire */
 
 #endif

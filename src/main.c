@@ -8,6 +8,7 @@
 #include "config.h"
 #include "history.h"
 #include "modules.h"
+#include "fishfuncs.h"
 #include "lineedit.h"
 #include "exec.h"
 #include "parser.h"
@@ -36,6 +37,12 @@ static void init_shell_process(bool interactive) {
     g_shell_is_interactive = interactive;
 }
 
+static void apply_scheme(const char *name) {
+    BuiltinFn cs = builtin_lookup("colorscheme");
+    char *argv[] = { (char *)"colorscheme", (char *)name, NULL };
+    if (cs) cs(2, argv);
+}
+
 static void init_subsystems(void) {
     vars_init();
     exec_init();
@@ -45,9 +52,11 @@ static void init_subsystems(void) {
     builtins_init();
     jobs_init();
     config_init();
+    config_scheme_hook = apply_scheme;
     config_load_default();
     history_init(config_history_size(), config_history_path());
     lineedit_init();
+    fishfuncs_install();
     modules_load_enabled();
 
     var_set("SPIRE_VERSION", SPIRE_VERSION, true);
@@ -173,12 +182,30 @@ static void source_rc_files(void) {
     if (home) { snprintf(path, sizeof(path), "%s/.spirerc", home); exec_source_file(path); }
 }
 
+/* fish_prompt / fish_right_prompt from a fish config replace the prompt */
+static void prepare_prompt(void) {
+    exec_emit_event("fish_prompt", 0, NULL);
+    fish_apply_colors();
+    char *left = fish_prompt_output("fish_prompt");
+    char *right = left ? fish_prompt_output("fish_right_prompt") : NULL;
+    if (right) { /* like fish: the right prompt is a single line */
+        char *w = right;
+        for (char *r = right; *r; r++) if (*r != '\n' && *r != '\r') *w++ = *r;
+        *w = '\0';
+    }
+    lineedit_set_prompt_override(left, right);
+    free(left); free(right);
+}
+
 static void repl(void) {
     init_shell_process(true);
-    source_rc_files();
+    fish_config_load();     /* ~/.config/fish, if there is one */
+    source_rc_files();      /* then spire's own, which can override it */
+    fish_greeting();
     while (!g_should_exit) {
         jobs_reap(true);
         exec_run_pending_traps();
+        prepare_prompt();
         char *line = lineedit_read(config_prompt());
         if (!line) {
             if (jobs_count() > 0 && !getenv("SPIRE_NO_JOB_WARNING")) {
@@ -228,7 +255,10 @@ static void repl(void) {
 
         if (st == PARSE_OK) {
             long t0 = now_ms();
+            char *ev[] = { acc.data };
+            exec_emit_event("fish_preexec", 1, ev);
             exec_program(root);
+            exec_emit_event("fish_postexec", 1, ev);
             g_last_duration_ms = now_ms() - t0;
             char buf[32];
             snprintf(buf, sizeof(buf), "%ld", g_last_duration_ms);

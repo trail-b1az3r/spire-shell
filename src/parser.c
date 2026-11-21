@@ -560,6 +560,7 @@ static Node *parse_funcdef_kw(Parser *p) {
     p_advance(p);
     /* fish options on the same line: -a/--argument-names NAMES..., -d/--description TEXT */
     strvec_t argnames; sv_init(&argnames);
+    strvec_t hooks; sv_init(&hooks);
     char *desc = NULL;
     while (p->cur.type == TOK_WORD && strcmp(p->cur.text, "{") != 0) {
         if (strcmp(p->cur.text, "-a") == 0 || strcmp(p->cur.text, "--argument-names") == 0) {
@@ -578,7 +579,33 @@ static Node *parse_funcdef_kw(Parser *p) {
             }
             continue;
         }
-        p_advance(p); /* other fish options (-w, -S, ...) are accepted and ignored */
+        if (strcmp(p->cur.text, "-e") == 0 || strcmp(p->cur.text, "--on-event") == 0 ||
+            strcmp(p->cur.text, "-v") == 0 || strcmp(p->cur.text, "--on-variable") == 0 ||
+            strncmp(p->cur.text, "--on-event=", 11) == 0 || strncmp(p->cur.text, "--on-variable=", 14) == 0) {
+            /* event hooks ride along as "event:NAME" / "var:NAME" words */
+            bool is_var = p->cur.text[1] == 'v' || strncmp(p->cur.text, "--on-variable", 13) == 0;
+            const char *eq = strchr(p->cur.text, '=');
+            char *name = NULL;
+            if (eq) name = xstrdup(eq + 1);
+            else { p_advance(p); if (p->cur.type == TOK_WORD) name = xstrdup(p->cur.text); }
+            if (name) {
+                dstr_t d; ds_init(&d); ds_append(&d, is_var ? "var:" : "event:"); ds_append(&d, name);
+                sv_push(&hooks, xstrdup(d.data));
+                ds_free(&d); free(name);
+            }
+            if (p->cur.type == TOK_WORD) p_advance(p);
+            continue;
+        }
+        if (strcmp(p->cur.text, "-w") == 0 || strcmp(p->cur.text, "--wraps") == 0 ||
+            strcmp(p->cur.text, "-j") == 0 || strcmp(p->cur.text, "--on-job-exit") == 0 ||
+            strcmp(p->cur.text, "-p") == 0 || strcmp(p->cur.text, "--on-process-exit") == 0 ||
+            strcmp(p->cur.text, "-s") == 0 || strcmp(p->cur.text, "--on-signal") == 0 ||
+            strcmp(p->cur.text, "-V") == 0 || strcmp(p->cur.text, "--inherit-variable") == 0) {
+            p_advance(p); /* option with a value */
+            if (p->cur.type == TOK_WORD) p_advance(p);
+            continue;
+        }
+        p_advance(p); /* other fish options (-S, --no-scope-shadowing, ...) are accepted and ignored */
     }
     skip_separators(p);
     bool brace_style = false;
@@ -586,8 +613,10 @@ static Node *parse_funcdef_kw(Parser *p) {
     const char *stop_brace[] = { "}", NULL };
     const char *stop_end[] = { "end", NULL };
     Node *body = parse_block(p, brace_style ? stop_brace : stop_end);
-    if (!body) { free(name); free(desc); sv_free(&argnames); return NULL; }
-    if (!expect_word(p, brace_style ? "}" : "end")) { free(name); free(desc); sv_free(&argnames); node_free(body); return NULL; }
+    if (!body) { free(name); free(desc); sv_free(&argnames); sv_free(&hooks); return NULL; }
+    if (!expect_word(p, brace_style ? "}" : "end")) { free(name); free(desc); sv_free(&argnames); sv_free(&hooks); node_free(body); return NULL; }
+    for (size_t i = 0; i < hooks.count; i++) sv_push_dup(&body->argv, hooks.items[i]);
+    sv_free(&hooks);
     /* argument names / description ride along on the body node */
     for (size_t i = 0; i < argnames.count; i++) sv_push_dup(&body->for_words, argnames.items[i]);
     sv_free(&argnames);

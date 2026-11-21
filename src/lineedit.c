@@ -15,6 +15,7 @@
 #include "config.h"
 #include "builtins.h"
 #include "vars.h"
+#include "exec.h"
 #include <termios.h>
 #include <unistd.h>
 #include <ctype.h>
@@ -22,6 +23,8 @@
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <poll.h>
+#include <time.h>
 
 static void wr(const char *s, size_t n) {
     while (n > 0) {
@@ -49,24 +52,68 @@ static void raw_on(void) {
     raw.c_oflag &= ~(unsigned)(OPOST);
     raw.c_cc[VMIN] = 1;
     raw.c_cc[VTIME] = 0;
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+    tcsetattr(STDIN_FILENO, TCSADRAIN, &raw);
     g_raw_active = true;
 }
 
 static void raw_off(void) {
     if (!g_raw_active) return;
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_orig_termios);
+    tcsetattr(STDIN_FILENO, TCSADRAIN, &g_orig_termios);
     g_raw_active = false;
 }
 
 void lineedit_shutdown(void) { raw_off(); }
 
+/* Two input queues sit in front of the terminal: keys produced by bound
+ * input functions ("raw": never matched against bindings again) and bytes
+ * read while matching a binding that turned out not to match (re-read
+ * normally). */
+static unsigned char g_rawq[1024];
+static size_t g_rawq_len = 0;
+static unsigned char g_pushq[64];
+static size_t g_pushq_len = 0;
+static bool g_last_raw = false;
+
+static void queue_raw(const char *bytes) {
+    size_t n = strlen(bytes);
+    if (g_rawq_len + n > sizeof(g_rawq)) return;
+    memcpy(g_rawq + g_rawq_len, bytes, n);
+    g_rawq_len += n;
+}
+
+static void queue_push(const unsigned char *bytes, size_t n) {
+    if (n == 0 || g_pushq_len + n > sizeof(g_pushq)) return;
+    memmove(g_pushq + n, g_pushq, g_pushq_len);
+    memcpy(g_pushq, bytes, n);
+    g_pushq_len += n;
+}
+
 static int read_byte(void) {
+    if (g_rawq_len) {
+        int c = g_rawq[0];
+        memmove(g_rawq, g_rawq + 1, --g_rawq_len);
+        g_last_raw = true;
+        return c;
+    }
+    g_last_raw = false;
+    if (g_pushq_len) {
+        int c = g_pushq[0];
+        memmove(g_pushq, g_pushq + 1, --g_pushq_len);
+        return c;
+    }
     unsigned char c;
     ssize_t n;
     do { n = read(STDIN_FILENO, &c, 1); } while (n < 0 && errno == EINTR);
     if (n <= 0) return -1;
     return c;
+}
+
+/* the next byte if one arrives within `ms`, else -2 */
+static int read_byte_within(int ms) {
+    if (g_rawq_len || g_pushq_len) return read_byte();
+    struct pollfd pfd = { STDIN_FILENO, POLLIN, 0 };
+    if (poll(&pfd, 1, ms) <= 0) return -2;
+    return read_byte();
 }
 
 static size_t term_width(void) {
@@ -240,13 +287,30 @@ static size_t render_menu(LState *s, dstr_t *out, size_t W) {
             else ds_append(out, col);
             /* text, truncated to its column */
             size_t tw = display_width(disp);
-            if (tw > L.textw) {
+            /* fish's pager: the part already typed is shown in its own style */
+            size_t pre = 0;
+            if (!selected && s->comp_orig) {
+                const char *typed = strrchr(s->comp_orig, '/');
+                typed = typed ? typed + 1 : s->comp_orig;
+                if (*typed == '"' || *typed == '\'') typed++;
+                size_t tl = strlen(typed);
+                if (tl && tl <= strlen(disp) && strncasecmp(disp, typed, tl) == 0 && tw <= L.textw) pre = tl;
+            }
+            if (pre) {
+                char *pc = ansi_code_for(config_color("completion_prefix"));
+                ds_append(out, ANSI_RESET); ds_append(out, pc); ds_append(out, col);
+                ds_append_n(out, disp, pre);
+                ds_append(out, ANSI_RESET); ds_append(out, col);
+                ds_append(out, disp + pre);
+                used = tw;
+                free(pc);
+            } else if (tw > L.textw) {
                 size_t k = 0, w = 0;
                 while (disp[k] && w + 1 < L.textw) { size_t st = k; k++; while (disp[k] && ((unsigned char)disp[k] & 0xC0) == 0x80) k++; w += display_width_n(disp + st, k - st); }
                 ds_append_n(out, disp, k); ds_append(out, "…");
                 used = w + 1;
             } else { ds_append(out, disp); used = tw; }
-            if (cd->kind == CK_DIR) { ds_append_c(out, '/'); used++; }
+            if (cd->kind == CK_DIR && disp[0] && disp[strlen(disp) - 1] != '/') { ds_append_c(out, '/'); used++; }
             if (!selected) ds_append(out, ANSI_RESET);
             if (cd->desc && L.descs) {
                 size_t pad = L.textw + 2 > used ? L.textw + 2 - used : 1;
@@ -340,6 +404,240 @@ static void redraw_ex(LState *s, bool final) {
 }
 
 static void redraw(LState *s) { redraw_ex(s, false); }
+
+static char *g_left_override = NULL, *g_right_override = NULL;
+
+void lineedit_set_prompt_override(const char *left, const char *right) {
+    free(g_left_override); free(g_right_override);
+    g_left_override = left ? xstrdup(left) : NULL;
+    g_right_override = right ? xstrdup(right) : NULL;
+}
+
+static char *render_primary(const char *fmt) {
+    if (fmt && g_left_override) return xstrdup(g_left_override);
+    return fmt ? prompt_render(fmt) : prompt_render_continuation();
+}
+
+/* exposed for the `commandline` builtin (completion functions call it) */
+static LState *g_active = NULL;
+const char *lineedit_buffer(void) { return g_active && g_active->buf.data ? g_active->buf.data : ""; }
+size_t lineedit_cursor(void) { return g_active ? g_active->cursor : 0; }
+
+/* ---- commandline edits (from `commandline` inside a bound command) ---- */
+
+static void set_buffer(LState *s, const char *text);
+static void insert_text(LState *s, const char *t, size_t n);
+
+bool lineedit_active(void) { return g_active != NULL; }
+
+void lineedit_replace(const char *text) {
+    if (!g_active) return;
+    set_buffer(g_active, text);
+}
+
+void lineedit_insert(const char *text) {
+    if (!g_active) return;
+    insert_text(g_active, text, strlen(text));
+}
+
+void lineedit_append(const char *text) {
+    if (!g_active) return;
+    size_t cur = g_active->cursor;
+    g_active->cursor = g_active->buf.len;
+    insert_text(g_active, text, strlen(text));
+    g_active->cursor = cur;
+}
+
+/* replaces the token under the cursor */
+void lineedit_replace_token(const char *text) {
+    if (!g_active) return;
+    LState *s = g_active;
+    size_t a = s->cursor, b = s->cursor;
+    while (a > 0 && !isspace((unsigned char)s->buf.data[a - 1]) && !strchr(";|&", s->buf.data[a - 1])) a--;
+    while (b < s->buf.len && !isspace((unsigned char)s->buf.data[b]) && !strchr(";|&", s->buf.data[b])) b++;
+    dstr_t d; ds_init(&d);
+    ds_append_n(&d, s->buf.data, a);
+    ds_append(&d, text);
+    size_t cur = d.len;
+    ds_append(&d, s->buf.data + b);
+    set_buffer(s, d.data);
+    s->cursor = cur;
+    ds_free(&d);
+}
+
+void lineedit_set_cursor(size_t pos) {
+    if (!g_active) return;
+    g_active->cursor = pos > g_active->buf.len ? g_active->buf.len : pos;
+}
+
+/* ---- key bindings ---- */
+
+typedef struct { char *seq; char *spec; strvec_t actions; } Binding;
+static Binding *g_binds = NULL;
+static size_t g_nbinds = 0, g_bind_cap = 0;
+
+/* fish input functions, as the keys that do the same thing here */
+static const char *const g_input_functions[][2] = {
+    {"forward-char", "\x06"}, {"forward-single-char", "\x06"}, {"backward-char", "\x02"},
+    {"beginning-of-line", "\x01"}, {"end-of-line", "\x05"}, {"beginning-of-buffer", "\x01"}, {"end-of-buffer", "\x05"},
+    {"forward-word", "\x1b" "f"}, {"backward-word", "\x1b" "b"}, {"forward-bigword", "\x1b" "f"}, {"backward-bigword", "\x1b" "b"},
+    {"kill-line", "\x0b"}, {"backward-kill-line", "\x15"}, {"kill-whole-line", "\x01\x0b"},
+    {"kill-word", "\x1b" "d"}, {"backward-kill-word", "\x1b\x7f"}, {"backward-kill-path-component", "\x1b\x7f"},
+    {"backward-kill-bigword", "\x17"}, {"kill-bigword", "\x1b" "d"},
+    {"delete-char", "\x1b[3~"}, {"backward-delete-char", "\x7f"}, {"delete-or-exit", "\x04"}, {"exit", "\x04"},
+    {"history-search-backward", "\x1b[A"}, {"history-search-forward", "\x1b[B"}, {"up-or-search", "\x1b[A"},
+    {"down-or-search", "\x1b[B"}, {"up-line", "\x1b[A"}, {"down-line", "\x1b[B"},
+    {"history-prefix-search-backward", "\x1b[A"}, {"history-prefix-search-forward", "\x1b[B"},
+    {"history-pager", "\x12"}, {"history-token-search-backward", "\x1b."},
+    {"complete", "\t"}, {"complete-and-search", "\x1b[Z"}, {"accept-autosuggestion", "\x05"},
+    {"forward-token", "\x1b" "f"}, {"backward-token", "\x1b" "b"},
+    {"execute", "\r"}, {"accept", "\r"}, {"clear-screen", "\x0c"}, {"cancel", "\x07"}, {"cancel-commandline", "\x03"},
+    {"undo", "\x1f"}, {"redo", ""}, {"yank", "\x19"}, {"transpose-chars", "\x14"}, {"transpose-words", "\x1b" "t"},
+    {"upcase-word", "\x1b" "u"}, {"downcase-word", "\x1b" "l"}, {"capitalize-word", "\x1b" "c"},
+    {"edit_command_buffer", "\x18\x05"}, {"togglecase-char", ""},
+    {"repaint", ""}, {"force-repaint", ""}, {"repaint-mode", ""}, {"suppress-autosuggestion", ""},
+    {"self-insert", ""}, {"and", ""}, {"or", ""}, {"nextd-or-forward-word", "\x1b" "f"}, {"prevd-or-backward-word", "\x1b" "b"},
+    {NULL, NULL}
+};
+
+static const char *input_function_keys(const char *name) {
+    for (int i = 0; g_input_functions[i][0]; i++) if (strcmp(g_input_functions[i][0], name) == 0) return g_input_functions[i][1];
+    return NULL;
+}
+
+bool lineedit_queue_function(const char *name) {
+    const char *keys = input_function_keys(name);
+    if (!keys) return false;
+    queue_raw(keys);
+    return true;
+}
+
+void lineedit_list_functions(strvec_t *out) {
+    for (int i = 0; g_input_functions[i][0]; i++) sv_push_dup(out, g_input_functions[i][0]);
+}
+
+/* fish key notation -> the bytes a terminal sends.
+ *   old style:  \cf  \e  \ef  \e[A  \t  \r  \x7f  a   (and literal control bytes)
+ *   new style:  ctrl-f  alt-f  ctrl-alt-x  up  down  left  right  home  end
+ *               tab  shift-tab  enter  backspace  delete  escape  space  f1..f12
+ * Arrows, home and end come in two encodings; both are returned. */
+void lineedit_key_seqs(const char *spec, bool terminfo_name, strvec_t *out) {
+    static const char *const named[][3] = {
+        {"up", "\x1b[A", "\x1bOA"}, {"down", "\x1b[B", "\x1bOB"}, {"right", "\x1b[C", "\x1bOC"}, {"left", "\x1b[D", "\x1bOD"},
+        {"home", "\x1b[H", "\x1bOH"}, {"end", "\x1b[F", "\x1bOF"}, {"tab", "\t", NULL}, {"shift-tab", "\x1b[Z", NULL},
+        {"btab", "\x1b[Z", NULL}, {"enter", "\r", NULL}, {"return", "\r", NULL}, {"backspace", "\x7f", NULL},
+        {"delete", "\x1b[3~", NULL}, {"dc", "\x1b[3~", NULL}, {"escape", "\x1b", NULL}, {"space", " ", NULL},
+        {"pageup", "\x1b[5~", NULL}, {"ppage", "\x1b[5~", NULL}, {"pagedown", "\x1b[6~", NULL}, {"npage", "\x1b[6~", NULL},
+        {"insert", "\x1b[2~", NULL}, {"f1", "\x1bOP", NULL}, {"f2", "\x1bOQ", NULL}, {"f3", "\x1bOR", NULL}, {"f4", "\x1bOS", NULL},
+        {"f5", "\x1b[15~", NULL}, {"f6", "\x1b[17~", NULL}, {"f7", "\x1b[18~", NULL}, {"f8", "\x1b[19~", NULL},
+        {"f9", "\x1b[20~", NULL}, {"f10", "\x1b[21~", NULL}, {"f11", "\x1b[23~", NULL}, {"f12", "\x1b[24~", NULL},
+        {"ctrl-up", "\x1b[1;5A", NULL}, {"ctrl-down", "\x1b[1;5B", NULL}, {"ctrl-right", "\x1b[1;5C", NULL}, {"ctrl-left", "\x1b[1;5D", NULL},
+        {"alt-up", "\x1b[1;3A", NULL}, {"alt-down", "\x1b[1;3B", NULL}, {"alt-right", "\x1b[1;3C", NULL}, {"alt-left", "\x1b[1;3D", NULL},
+        {NULL, NULL, NULL}
+    };
+    const char *key = spec;
+    if (terminfo_name && strncmp(key, "key_", 4) == 0) key += 4;
+    for (int i = 0; named[i][0]; i++) {
+        if (strcasecmp(named[i][0], key) == 0) {
+            sv_push_dup(out, named[i][1]);
+            if (named[i][2]) sv_push_dup(out, named[i][2]);
+            return;
+        }
+    }
+    if (terminfo_name) return;
+    /* ctrl-X / alt-X / ctrl-alt-X */
+    bool ctrl = false, alt = false;
+    const char *p = spec;
+    for (;;) {
+        if (strncasecmp(p, "ctrl-", 5) == 0 && p[5]) { ctrl = true; p += 5; continue; }
+        if (strncasecmp(p, "alt-", 4) == 0 && p[4]) { alt = true; p += 4; continue; }
+        break;
+    }
+    if ((ctrl || alt) && p != spec) {
+        dstr_t d; ds_init(&d);
+        if (alt) ds_append_c(&d, 0x1b);
+        strvec_t inner; sv_init(&inner);
+        if (strlen(p) > 1) lineedit_key_seqs(p, false, &inner);
+        if (inner.count) ds_append(&d, inner.items[0]);
+        else ds_append_c(&d, ctrl ? (char)(tolower((unsigned char)p[0]) & 0x1f) : p[0]);
+        sv_free(&inner);
+        sv_push(out, xstrdup(d.data));
+        ds_free(&d);
+        return;
+    }
+    /* old-style escapes */
+    dstr_t d; ds_init(&d);
+    for (const char *q = spec; *q; q++) {
+        if (*q != '\\' || !q[1]) { ds_append_c(&d, *q); continue; }
+        q++;
+        switch (*q) {
+            case 'c': if (q[1]) { ds_append_c(&d, (char)(tolower((unsigned char)q[1]) & 0x1f)); q++; } break;
+            case 'C': if (q[1]) { ds_append_c(&d, (char)(tolower((unsigned char)q[1]) & 0x1f)); q++; } break;
+            case 'e': ds_append_c(&d, 0x1b); break;
+            case 'n': ds_append_c(&d, '\n'); break;
+            case 'r': ds_append_c(&d, '\r'); break;
+            case 't': ds_append_c(&d, '\t'); break;
+            case 'b': ds_append_c(&d, 0x08); break;
+            case 'a': ds_append_c(&d, 0x07); break;
+            case 'x': {
+                int v = 0, k = 0;
+                while (k < 2 && isxdigit((unsigned char)q[1])) { q++; v = v * 16 + (isdigit((unsigned char)*q) ? *q - '0' : tolower((unsigned char)*q) - 'a' + 10); k++; }
+                ds_append_c(&d, (char)v);
+                break;
+            }
+            default: ds_append_c(&d, *q); break;
+        }
+    }
+    if (d.len) sv_push(out, xstrdup(d.data));
+    ds_free(&d);
+}
+
+void lineedit_bind(const char *seq, const char *spec, int nact, char **acts) {
+    for (size_t i = 0; i < g_nbinds; i++) {
+        if (strcmp(g_binds[i].seq, seq) == 0) {
+            sv_clear(&g_binds[i].actions);
+            for (int k = 0; k < nact; k++) sv_push_dup(&g_binds[i].actions, acts[k]);
+            free(g_binds[i].spec);
+            g_binds[i].spec = xstrdup(spec);
+            return;
+        }
+    }
+    if (g_nbinds == g_bind_cap) { g_bind_cap = g_bind_cap ? g_bind_cap * 2 : 16; g_binds = xrealloc(g_binds, sizeof(Binding) * g_bind_cap); }
+    Binding *b = &g_binds[g_nbinds++];
+    b->seq = xstrdup(seq);
+    b->spec = xstrdup(spec);
+    sv_init(&b->actions);
+    for (int k = 0; k < nact; k++) sv_push_dup(&b->actions, acts[k]);
+}
+
+bool lineedit_unbind(const char *seq) {
+    for (size_t i = 0; i < g_nbinds; i++) {
+        if (strcmp(g_binds[i].seq, seq) == 0) {
+            free(g_binds[i].seq); free(g_binds[i].spec); sv_free(&g_binds[i].actions);
+            g_binds[i] = g_binds[--g_nbinds];
+            return true;
+        }
+    }
+    return false;
+}
+
+void lineedit_list_binds(strvec_t *out) {
+    for (size_t i = 0; i < g_nbinds; i++) {
+        dstr_t d; ds_init(&d);
+        ds_append(&d, g_binds[i].spec);
+        for (size_t k = 0; k < g_binds[i].actions.count; k++) {
+            ds_append(&d, " ");
+            bool plain = strpbrk(g_binds[i].actions.items[k], " '\"$;|&()") == NULL;
+            if (!plain) ds_append_c(&d, '\'');
+            ds_append(&d, g_binds[i].actions.items[k]);
+            if (!plain) ds_append_c(&d, '\'');
+        }
+        bool dup = false;
+        for (size_t k = 0; k < out->count; k++) if (strcmp(out->items[k], d.data) == 0) dup = true;
+        if (!dup) sv_push(out, xstrdup(d.data));
+        ds_free(&d);
+    }
+}
 
 /* ---------- editing primitives ---------- */
 
@@ -788,6 +1086,43 @@ static void print_prompt_head(const char *rendered, char **tail_out) {
     } else *tail_out = xstrdup(rendered);
 }
 
+/* is there unread input (type-ahead)? */
+static bool input_pending(void) {
+    struct pollfd pfd = { STDIN_FILENO, POLLIN, 0 };
+    return poll(&pfd, 1, 0) > 0;
+}
+
+/* Fade a new prompt in, from dim grey to its real colors, over a few
+ * frames. Skipped when keys are already waiting, so it never slows typing. */
+static void animate_prompt(const char *ptail) {
+    if (strcmp(config_get("prompt.animate", "yes"), "no") == 0) return;
+    const char *term = getenv("TERM");
+    if (!term || strcmp(term, "dumb") == 0) return;
+    long total_ms = atol(config_get("prompt.animate_ms", "60"));
+    if (total_ms <= 0) return;
+    /* the prompt's text without its colors */
+    dstr_t plain; ds_init(&plain);
+    for (const char *p = ptail; *p; p++) {
+        if (*p == 0x1b && p[1] == '[') { p += 2; while (*p && !(*p >= 0x40 && *p <= 0x7e)) p++; if (!*p) break; continue; }
+        ds_append_c(&plain, *p);
+    }
+    static const int shades[] = { 237, 240, 244, 248 };
+    int frames = (int)(sizeof(shades) / sizeof(shades[0]));
+    struct timespec ts = { 0, (total_ms * 1000000L) / frames };
+    for (int i = 0; i < frames; i++) {
+        if (input_pending()) break;
+        char frame[64];
+        snprintf(frame, sizeof(frame), "\x1b[?25l\r\x1b[38;5;%dm", shades[i]);
+        dstr_t out; ds_init(&out);
+        ds_append(&out, frame); ds_append(&out, plain.data); ds_append(&out, "\x1b[0m\x1b[K");
+        wr(out.data, out.len);
+        ds_free(&out);
+        nanosleep(&ts, NULL);
+    }
+    wrs("\x1b[?25h");
+    ds_free(&plain);
+}
+
 static char *read_plain_line(void) {
     dstr_t buf; ds_init(&buf);
     int c; bool any = false;
@@ -802,10 +1137,98 @@ static char *read_plain_line(void) {
     return r;
 }
 
+/* runs a bound shell command with the line editor still active, so it can
+ * use `commandline` to read and change the line. Its standard output is
+ * shown above a fresh prompt; with no output, the line just repaints. */
+static void run_bound_command(LState *s, const char *cmd) {
+    fflush(stdout);
+    raw_off();
+    char tmpl[] = "/tmp/spire-bind-XXXXXX";
+    int fd = mkstemp(tmpl);
+    int saved = -1;
+    if (fd >= 0) {
+        unlink(tmpl);
+        saved = dup(STDOUT_FILENO);
+        dup2(fd, STDOUT_FILENO);
+    }
+    exec_eval_string(cmd);
+    fflush(stdout);
+    dstr_t out; ds_init(&out);
+    if (fd >= 0) {
+        dup2(saved, STDOUT_FILENO);
+        close(saved);
+        lseek(fd, 0, SEEK_SET);
+        char chunk[4096]; ssize_t r;
+        while ((r = read(fd, chunk, sizeof(chunk))) > 0) ds_append_n(&out, chunk, (size_t)r);
+        close(fd);
+    }
+    raw_on();
+    if (s->cursor > s->buf.len) s->cursor = s->buf.len;
+    if (out.len) {
+        size_t cur = s->cursor;
+        s->cursor = s->buf.len;
+        redraw_ex(s, true);
+        s->cursor = cur;
+        dstr_t t; ds_init(&t);
+        ds_append(&t, "\r\n");
+        for (size_t i = 0; i < out.len; i++) { if (out.data[i] == '\n') ds_append_c(&t, '\r'); ds_append_c(&t, out.data[i]); }
+        if (out.data[out.len - 1] != '\n') ds_append(&t, "\r\n");
+        wr(t.data, t.len);
+        ds_free(&t);
+        s->cur_row = 0;
+    }
+    ds_free(&out);
+    redraw(s);
+}
+
+static void dispatch_binding(LState *s, Binding *b) {
+    for (size_t k = 0; k < b->actions.count; k++) {
+        const char *a = b->actions.items[k];
+        const char *keys = input_function_keys(a);
+        if (keys) {
+            if (*keys) queue_raw(keys);
+            else redraw(s); /* repaint, suppress-autosuggestion, ... */
+            continue;
+        }
+        run_bound_command(s, a);
+    }
+}
+
+/* Is byte `c` the start of a bound key sequence? Reads further bytes as
+ * needed (waiting a little for the rest of a sequence); bytes that don't
+ * complete a binding go back to be read normally. */
+static bool try_binding(LState *s, int c) {
+    if (g_nbinds == 0) return false;
+    unsigned char seq[16];
+    size_t n = 0;
+    seq[n++] = (unsigned char)c;
+    for (;;) {
+        int exact = -1;
+        bool longer = false;
+        for (size_t i = 0; i < g_nbinds; i++) {
+            size_t len = strlen(g_binds[i].seq);
+            if (len >= n && memcmp(g_binds[i].seq, seq, n) == 0) {
+                if (len == n) exact = (int)i;
+                else longer = true;
+            }
+        }
+        if (exact < 0 && !longer) { queue_push(seq + 1, n - 1); return false; }
+        if (exact >= 0 && !longer) { dispatch_binding(s, &g_binds[exact]); return true; }
+        if (n >= sizeof(seq)) { queue_push(seq + 1, n - 1); return false; }
+        int nb = read_byte_within(seq[0] == 0x1b ? 60 : 500);
+        if (nb < 0) {
+            if (exact >= 0) { dispatch_binding(s, &g_binds[exact]); return true; }
+            queue_push(seq + 1, n - 1);
+            return false;
+        }
+        seq[n++] = (unsigned char)nb;
+    }
+}
+
 char *lineedit_read(const char *prompt_fmt) {
     if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) return read_plain_line();
 
-    char *prompt_rendered = prompt_fmt ? prompt_render(prompt_fmt) : prompt_render_continuation();
+    char *prompt_rendered = render_primary(prompt_fmt);
 
     raw_on();
     LState s; memset(&s, 0, sizeof(s));
@@ -813,19 +1236,23 @@ char *lineedit_read(const char *prompt_fmt) {
     sv_init(&s.undo);
     s.sel = -1;
     const char *rfmt = config_get("rprompt", "");
-    s.rprompt = (prompt_fmt && rfmt && *rfmt) ? prompt_render(rfmt) : NULL;
+    if (prompt_fmt && g_left_override) s.rprompt = g_right_override ? xstrdup(g_right_override) : NULL;
+    else s.rprompt = (prompt_fmt && rfmt && *rfmt) ? prompt_render(rfmt) : NULL;
     if (s.rprompt && display_width(s.rprompt) == 0) { free(s.rprompt); s.rprompt = NULL; }
 
     if (prompt_fmt) prompt_sp();
     print_prompt_head(prompt_rendered, &s.ptail);
+    if (prompt_fmt) animate_prompt(s.ptail);
     bool eof = false;
     int last_key = 0;
+    g_active = &s;
 
     redraw(&s);
 
     for (;;) {
         int c = read_byte();
         if (c < 0) { eof = s.buf.len == 0; break; }
+        if (!g_last_raw && try_binding(&s, c)) continue;
 
         char *before = xstrdup(s.buf.data);
         int key = c;
@@ -862,7 +1289,7 @@ char *lineedit_read(const char *prompt_fmt) {
                 hist_reset(&s);
                 s.cur_row = 0;
                 {
-                    char *fresh = prompt_fmt ? prompt_render(prompt_fmt) : prompt_render_continuation();
+                    char *fresh = render_primary(prompt_fmt);
                     free(s.ptail);
                     print_prompt_head(fresh, &s.ptail);
                     free(fresh);
@@ -877,7 +1304,7 @@ char *lineedit_read(const char *prompt_fmt) {
             case 12: /* Ctrl-L */
                 wrs("\x1b[H\x1b[2J");
                 {
-                    char *fresh = prompt_fmt ? prompt_render(prompt_fmt) : prompt_render_continuation();
+                    char *fresh = render_primary(prompt_fmt);
                     free(s.ptail);
                     print_prompt_head(fresh, &s.ptail);
                     free(fresh);
@@ -1029,6 +1456,7 @@ char *lineedit_read(const char *prompt_fmt) {
         last_key = key;
     }
 
+    g_active = NULL;
     menu_close(&s);
     raw_off();
     hist_reset(&s);

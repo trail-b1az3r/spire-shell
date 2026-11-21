@@ -5,6 +5,7 @@
 #include "funcs.h"
 #include "builtins.h"
 #include "vars.h"
+#include "fishfuncs.h"
 #include <ctype.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -45,6 +46,7 @@ bool command_exists(const char *name) {
     if (alias_get(name)) return true;
     if (func_get(name)) return true;
     if (builtin_exists(name)) return true;
+    if (fish_function_file_exists(name)) return true;
     if (strchr(name, '/')) return access(name, X_OK) == 0;
     const char *path = var_get("PATH");
     if (!path) return false;

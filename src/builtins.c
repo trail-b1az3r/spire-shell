@@ -47,6 +47,7 @@ static int b_cd(int argc, char **argv) {
     if (oldpwd) var_set("OLDPWD", oldpwd, true);
     char newpwd[4096];
     if (getcwd(newpwd, sizeof(newpwd))) var_set("PWD", newpwd, true);
+    exec_emit_var("PWD");
     return 0;
 }
 
@@ -97,7 +98,24 @@ static int b_alias(int argc, char **argv) {
         sv_free(&names); sv_free(&values);
         return 0;
     }
+    if (argc == 3 && !strchr(argv[1], '=') && strcmp(argv[1], "-s") != 0 && strcmp(argv[1], "--save") != 0) {
+        /* fish: `alias NAME 'command ...'` defines a wrapper function */
+        dstr_t src; ds_init(&src);
+        ds_append(&src, "function "); ds_append(&src, argv[1]);
+        ds_append(&src, " --description 'alias "); ds_append(&src, argv[1]); ds_append(&src, "'\n");
+        /* avoid infinite recursion for `alias ls 'ls -l'`: call the command */
+        const char *val = argv[2];
+        size_t nl = strlen(argv[1]);
+        if (strncmp(val, argv[1], nl) == 0 && (val[nl] == ' ' || val[nl] == '\0')) ds_append(&src, "command ");
+        ds_append(&src, val);
+        ds_append(&src, " \"$@\"\nend\n");
+        alias_unset(argv[1]);
+        int st = exec_source_string(src.data);
+        ds_free(&src);
+        return st;
+    }
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--save") == 0) continue;
         char *eq = strchr(argv[i], '=');
         if (!eq) {
             const char *v = alias_get(argv[i]);
@@ -147,25 +165,19 @@ static int b_let(int argc, char **argv) {
  * -b NAME sets the background instead. */
 static int b_set_color(int argc, char **argv) {
     if (argc < 2) return 0;
-    bool bg = false;
-    int i = 1;
-    if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) { bg = true; i++; }
-    const char *name = argv[i];
-    if (strcmp(name, "normal") == 0 || strcmp(name, "reset") == 0) { fputs(ANSI_RESET, stdout); return 0; }
-    char *code = ansi_code_for(name);
-    if (bg && code[0]) {
-        /* crude fg->bg shift: 3x/9x -> 4x/10x */
-        dstr_t d; ds_init(&d);
-        for (char *p = code; *p; p++) {
-            if (*p == '3' && p[1] != ';' ) { ds_append_c(&d, '4'); continue; }
-            if (*p == '9' && isdigit((unsigned char)p[1])) { ds_append(&d, "10"); continue; }
-            ds_append_c(&d, *p);
+    if (strcmp(argv[1], "--print-colors") == 0 || strcmp(argv[1], "-c") == 0) {
+        const char *names[] = {"black","red","green","yellow","blue","magenta","cyan","white","brblack","brred",
+                               "brgreen","bryellow","brblue","brmagenta","brcyan","brwhite","normal", NULL};
+        for (int i = 0; names[i]; i++) {
+            char *a[] = { (char *)names[i] };
+            char *code = fish_color_ansi(1, a);
+            printf("%s%s\x1b[0m\n", code, names[i]);
+            free(code);
         }
-        fputs(d.data, stdout);
-        ds_free(&d);
-    } else {
-        fputs(code, stdout);
+        return 0;
     }
+    char *code = fish_color_ansi(argc - 1, argv + 1);
+    fputs(code, stdout);
     free(code);
     return 0;
 }
@@ -209,7 +221,45 @@ static int b_colorscheme(int argc, char **argv) {
         return 0;
     }
     if (strcmp(argv[1], "list") == 0) {
-        printf("dark\nlight\nmono\nsolarized\nnord\ngruvbox\ndracula\n");
+        printf("fish\nspire\ndark\nlight\nmono\nsolarized\nnord\ngruvbox\ndracula\n");
+        return 0;
+    }
+    if (strcmp(argv[1], "fish") == 0) {
+        config_set("color.command", "default");
+        config_set("color.command_invalid", "brightred");
+        config_set("color.builtin", "default");
+        config_set("color.function", "default");
+        config_set("color.keyword", "default");
+        config_set("color.string", "yellow");
+        config_set("color.variable", "brightcyan");
+        config_set("color.operator", "green");
+        config_set("color.redirect", "bold-cyan");
+        config_set("color.comment", "red");
+        config_set("color.number", "cyan");
+        config_set("color.path", "cyan");
+        config_set("color.array", "cyan");
+        config_set("color.flag", "cyan");
+        config_set("color.escape", "brightcyan");
+        config_set("color.suggestion", "brightblack");
+        config_set("color.text", "cyan");
+        config_set("color.description", "italic-yellow");
+        config_set("color.selection", "reverse");
+        config_set("color.completion", "default");
+        config_set("color.completion_prefix", "bold-underline-default");
+        config_set("color.error", "brightred");
+        return 0;
+    }
+    if (strcmp(argv[1], "spire") == 0) {
+        /* spire 1.1's own palette */
+        config_set("color.command", "green"); config_set("color.command_invalid", "red");
+        config_set("color.builtin", "blue"); config_set("color.function", "brightblue");
+        config_set("color.string", "yellow"); config_set("color.variable", "cyan");
+        config_set("color.operator", "magenta"); config_set("color.redirect", "brightmagenta");
+        config_set("color.comment", "brightblack"); config_set("color.keyword", "blue");
+        config_set("color.number", "magenta"); config_set("color.path", "white");
+        config_set("color.array", "brightmagenta"); config_set("color.flag", "brightcyan");
+        config_set("color.escape", "brightcyan"); config_set("color.text", "default");
+        config_set("color.description", "brightblack"); config_set("color.completion_prefix", "default");
         return 0;
     }
     if (strcmp(argv[1], "dark") == 0) {
@@ -256,7 +306,7 @@ static int b_colorscheme(int argc, char **argv) {
         config_set("color.number", "215"); config_set("color.flag", "117");
     } else {
         sh_err("colorscheme: unknown scheme '%s' "
-                         "(try dark, light, mono, solarized, nord, gruvbox, dracula)\n", argv[1]);
+                         "(try fish, spire, dark, light, mono, solarized, nord, gruvbox, dracula)\n", argv[1]);
         return 1;
     }
     /* classes added later follow the preset's closest relatives */

@@ -86,4 +86,9 @@ int exec_run_argv_nofunc(int argc, char **argv);
 void exec_assign(const char *raw);
 bool exec_looks_like_assignment(const char *s);
 
+/* fish events: runs every function declared `--on-event NAME` (or
+ * `--on-variable NAME` for exec_emit_var) with the given arguments */
+void exec_emit_event(const char *name, int argc, char **argv);
+void exec_emit_var(const char *name);
+
 #endif

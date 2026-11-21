@@ -21,6 +21,7 @@
 #include "lexer.h"
 #include "jobs.h"
 #include "config.h"
+#include "fishfuncs.h"
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -657,6 +658,8 @@ static void parse_help_text(const char *text, CandList *out) {
 }
 
 static void add_help_options(const char *cmd, CandList *out) {
+    /* ll and la wrap ls (like fish's --wraps) */
+    if (strcmp(cmd, "ll") == 0 || strcmp(cmd, "la") == 0) cmd = "ls";
     const char *cfg = config_get("complete.parse_help", "yes");
     if (strcmp(cfg, "no") == 0) return;
     for (int i = 0; i < g_help_n; i++) {
@@ -1229,6 +1232,7 @@ void complete_line(const char *line, size_t cursor, Completion *res) {
             goto filter;
         }
         bool want_files = true;
+        fish_autoload_completion(ctx.cmd);
         if (rules_exist_for(ctx.cmd) && apply_rules(&ctx, word, line, &all, &want_files)) {
             if (word[0] == '-' && all.count == 0) add_help_options(ctx.cmd, &all);
             if (want_files && word[0] != '-') add_files(word, &all, false);

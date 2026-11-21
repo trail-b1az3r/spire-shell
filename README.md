@@ -56,7 +56,46 @@ toy. It is, however, a big project built in one sitting, so see
   `!prefix`, `!!:$`, and `^old^new`. A leading space keeps a command out of
   history.
 
+### Your fish config, as is
+
+If you have `~/.config/fish` (or `$XDG_CONFIG_HOME/fish`), interactive spire
+loads it the way fish does: universal variables from `fish_variables`
+(including `fish_user_paths` and a `fish_color_*` theme), every
+`conf.d/*.fish` in order, then `config.fish`. Functions in `functions/` and
+completions in `completions/` are autoloaded on first use. Your
+`fish_prompt`, `fish_right_prompt` and `fish_greeting` are used, functions
+declared `--on-event fish_prompt / fish_preexec / fish_postexec` or
+`--on-variable PWD` fire, and the builtins and helpers configs reach for
+exist: `set_color` (names, `br*`, hex, `--bold`, `--background=`),
+`alias NAME 'cmd …'`, `abbr`, `emit`, `psub`,
+`fish_add_path`, `prompt_pwd`, `fish_vcs_prompt`/`fish_git_prompt`,
+`functions --copy`, `bind` (real key bindings: fish input functions like
+`forward-char` or `history-search-backward`, or any command, in old
+`\\cf`/`\\e[A` or new `ctrl-f`/`alt-x`/`up` notation, `-k` names, `-e`),
+`commandline` that reads *and changes* the line (`-r`, `-i`, `-a`, `-t`,
+`-C`, `-f`),
+`type -q`, `command -q/-s`, `status --is-interactive`, `isatty`,
+`string split -f`, `__fish_seen_subcommand_from` and friends. `cmd | source`
+and `cmd | read` run in the shell, so `zoxide init fish | source`-style
+lines work. spire's own `~/.config/spire/config.spire` runs afterwards and
+can override anything. Turn it off with `fish_config = no`.
+
 ### Interactive: completion, editing, color
+
+- **fish's colors, 1:1, by default.** Syntax highlighting, autosuggestions
+  and the completion pager use fish's default theme (commands in the
+  terminal's normal color, arguments cyan, quotes yellow, errors bright red,
+  `;`/`|`/`&` green, redirections bold cyan, comments red, descriptions
+  yellow italic, the typed prefix bold+underlined). `colorscheme spire`
+  brings back spire's own palette.
+- **The prompt** is `user ❯ ` followed by what you type; the `❯` turns red
+  after a failed command, and inside a git repository the branch shows on
+  the right. Each new prompt fades in over ~60 ms (skipped when you're
+  typing ahead; `prompt.animate = no` turns it off).
+- **`ls`, `ll` and `la` behave like fish's functions**: color and `-F` type
+  indicators on a terminal, plain when piped, `ll` = `ls -lh`,
+  `la` = `ls -lAh` — so `ll` or `ls -la` is colored with no aliases. With
+  no `$LS_COLORS`, spire loads the full palette from `dircolors`.
 
 - **Context-aware Tab completion** with a fish/zsh-style menu: candidates
   are laid out in a grid with **descriptions**, colored by kind (files use
@@ -255,7 +294,7 @@ with a dirty marker, `%?` last exit status, `%E` `✘ N` only after a failure,
 command if it was slow, `%T` `%*` `%t` time, `%D{strftime}`, `%v`
 virtualenv, `%h` history number, `%#` `#`/`$`, `%F{color}…%f` and
 `%K{color}…%k` foreground/background, `%B…%b` bold, `%U…%u` underline,
-`%(?.yes.no)` conditionals (`?` success, `j` jobs, `#` root, `N` status N),
+`%r` git branch name, `%(g.in-repo.not)`, `%P` fish-style shortened cwd (`~/s/project`), `%(?.yes.no)` conditionals (`?` success, `j` jobs, `#` root, `N` status N),
 `%%` a literal `%`.
 
 Color values: `black red green yellow blue magenta cyan white default`,
