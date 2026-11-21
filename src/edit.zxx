@@ -1,0 +1,864 @@
+// edit.zxx - the line editor, prompt, highlighting and completion.
+
+var RAW = false
+var CMD_CACHE = null
+var CMD_CACHE_PATH = ""
+
+fn raw_mode(enable) {
+    if enable != RAW and os.isatty(0) {
+        os.raw(enable)
+        RAW = enable
+    }
+}
+
+fn ctrl(c) {
+    return os.chr(os.ord(c) - 96)
+}
+
+// ---------------------------------------------------------------- commands
+
+fn path_cmds() {
+    let p = var_get1("PATH")
+    if CMD_CACHE == null or p != CMD_CACHE_PATH {
+        CMD_CACHE = {}
+        for c in os.path_commands() {
+            CMD_CACHE[c] = true
+        }
+        CMD_CACHE_PATH = p
+    }
+    return CMD_CACHE
+}
+
+fn command_known(w) {
+    if w in BUILTINS or w in FUNCS or w in ALIASES or w in ABBRS or w in KEYWORDS {
+        return true
+    }
+    if w.index_of("/") >= 0 {
+        let s = os.stat(w)
+        return s != null and (s.exec or s.dir)
+    }
+    return w in path_cmds() or fish_function_file(w) != null or is_dir(w)
+}
+
+const KEYWORDS = ["if", "then", "else", "elif", "fi", "end", "for", "in", "while", "until", "do", "done",
+                  "function", "switch", "case", "esac", "begin", "and", "or", "not", "time", "{", "}", "!"]
+
+// Levenshtein distance with adjacent transpositions ("gti" -> "git" is 1)
+fn edit_distance(a, b) {
+    let la = len(a)
+    let lb = len(b)
+    var d = [[0 for _ in 0..=lb] for _ in 0..=la]
+    for i in 0..=la {
+        d[i][0] = i
+    }
+    for j in 0..=lb {
+        d[0][j] = j
+    }
+    for i in 1..=la {
+        for j in 1..=lb {
+            let cost = a[i - 1] == b[j - 1] ? 0 : 1
+            var v = min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost)
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1] {
+                v = min(v, d[i - 2][j - 2] + 1)
+            }
+            d[i][j] = v
+        }
+    }
+    return d[la][lb]
+}
+
+// "did you mean" for an unknown command
+fn suggest(name) {
+    if len(name) < 2 {
+        return null
+    }
+    let cap = len(name) <= 3 ? 1 : 2
+    var best = null
+    var bestd = cap + 1
+    for c in keys(path_cmds()) + keys(BUILTINS) + keys(FUNCS) {
+        if abs(len(c) - len(name)) > cap {
+            continue
+        }
+        let d = edit_distance(name, c)
+        if d < bestd or (d == bestd and best != null and len(c) < len(best)) {
+            best = c
+            bestd = d
+        }
+    }
+    return best
+}
+
+// ---------------------------------------------------------------- highlight
+
+// fish's default theme
+const C_ERROR = "\e[91m"
+const C_PARAM = "\e[36m"
+const C_QUOTE = "\e[33m"
+const C_VAR = "\e[96m"
+const C_END = "\e[32m"
+const C_REDIR = "\e[1;36m"
+const C_COMMENT = "\e[31m"
+const C_SUGGEST = "\e[90m"
+const RESET = "\e[0m"
+
+fn highlight(line) {
+    let cs = line.chars()
+    let n = len(cs)
+    var o = ""
+    var i = 0
+    var cmd_pos = true
+    while i < n {
+        let c = cs[i]
+        if c == " " or c == "\t" {
+            o = o + c
+            i += 1
+            continue
+        }
+        if c == "#" {
+            o = o + C_COMMENT + join(cs[i:], "") + RESET
+            break
+        }
+        if c == ";" or c == "|" or c == "&" {
+            var j = i
+            while j < n and (cs[j] == "|" or cs[j] == "&" or cs[j] == ";") {
+                j += 1
+            }
+            o = o + C_END + join(cs[i:j], "") + RESET
+            cmd_pos = true
+            i = j
+            continue
+        }
+        if c == ">" or c == "<" {
+            var j = i
+            while j < n and (cs[j] == ">" or cs[j] == "<" or cs[j] == "&" or ("0" <= cs[j] and cs[j] <= "9")) {
+                j += 1
+            }
+            o = o + C_REDIR + join(cs[i:j], "") + RESET
+            i = j
+            continue
+        }
+        // a word
+        var j = i
+        var sq = false
+        var dq = false
+        var depth = 0
+        while j < n {
+            let d = cs[j]
+            if not sq and not dq and depth == 0 and (d == " " or d == "\t" or d == ";" or d == "|" or d == "&" or d == ">" or d == "<") {
+                break
+            }
+            if d == "\\" {
+                j += 2
+                continue
+            }
+            if d == "'" and not dq {
+                sq = not sq
+            } elif d == "\"" and not sq {
+                dq = not dq
+            } elif d == "(" and not sq {
+                depth += 1
+            } elif d == ")" and not sq and depth > 0 {
+                depth -= 1
+            }
+            j += 1
+        }
+        if j > n {
+            j = n
+        }
+        let w = join(cs[i:j], "")
+        if cmd_pos {
+            if w in KEYWORDS {
+                o = o + w
+            } elif w.index_of("=") > 0 and is_assignment(w) {
+                o = o + color_word(w, C_PARAM)
+                i = j
+                continue
+            } elif w.index_of("$") >= 0 or w.index_of("'") >= 0 or w.index_of("\"") >= 0 {
+                o = o + color_word(w, "")
+                cmd_pos = false
+            } else {
+                o = o + (command_known(w) ? w : C_ERROR + w + RESET)
+                cmd_pos = false
+            }
+        } else {
+            let plain = w.index_of("$") < 0 and w.index_of("'") < 0 and w.index_of("\"") < 0
+            let p = w.starts_with("~/") ? os.home() + w[1:] : w
+            if plain and len(w) > 1 and os.stat(p) != null {
+                o = o + C_PARAM + "\e[4m" + w + RESET // fish: valid paths underlined
+            } else {
+                o = o + color_word(w, C_PARAM)
+            }
+        }
+        i = j
+    }
+    return o
+}
+
+// a word's quotes and variables in their own colors
+fn color_word(w, base) {
+    let cs = w.chars()
+    var o = base
+    var i = 0
+    while i < len(cs) {
+        let c = cs[i]
+        if c == "'" or c == "\"" {
+            var j = i + 1
+            while j < len(cs) and cs[j] != c {
+                j += 1
+            }
+            o = o + C_QUOTE + join(cs[i:min(j + 1, len(cs))], "") + RESET + base
+            i = j + 1
+            continue
+        }
+        if c == "$" {
+            var j = i + 1
+            while j < len(cs) and is_name_char(cs[j]) {
+                j += 1
+            }
+            o = o + C_VAR + join(cs[i:j], "") + RESET + base
+            i = j
+            continue
+        }
+        o = o + c
+        i += 1
+    }
+    return o + RESET
+}
+
+// ---------------------------------------------------------------- prompt
+
+var GIT_CACHE = {dir: "", branch: ""}
+
+fn git_branch() {
+    // walk up for .git before running git: cheap outside repositories
+    var d = os.cwd()
+    var found = false
+    loop {
+        if os.stat(d + "/.git") != null {
+            found = true
+            break
+        }
+        let k = last_index(d, "/")
+        if k <= 0 {
+            break
+        }
+        d = d[:k]
+    }
+    if not found {
+        return ""
+    }
+    let r = os.run([["git", "symbolic-ref", "--short", "HEAD"]], {capture: true, stderr: "/dev/null"})
+    var b = r.output.trim()
+    if b == "" {
+        b = os.run([["git", "rev-parse", "--short", "HEAD"]], {capture: true, stderr: "/dev/null"}).output.trim()
+    }
+    return b
+}
+
+fn short_pwd() {
+    var p = os.cwd()
+    let home = os.home()
+    if p == home {
+        return "~"
+    }
+    if p.starts_with(home + "/") {
+        p = "~" + p[len(home):]
+    }
+    let parts = p.split("/")
+    var o = []
+    var k = 0
+    for part in parts {
+        if k < len(parts) - 1 and len(part) > 1 {
+            o.push(part.starts_with(".") ? part[:2] : part[0])
+        } else {
+            o.push(part)
+        }
+        k += 1
+    }
+    return join(o, "/")
+}
+
+// [left, right]: fish_prompt / fish_right_prompt if defined, else
+// `user ❯ ` with the git branch on the right
+fn make_prompt() {
+    if "fish_prompt" in FUNCS or try_autoload("fish_prompt") {
+        let saved = STATUS
+        OUTBUF.push("")
+        call_function(FUNCS["fish_prompt"], ["fish_prompt"])
+        let left = OUTBUF.pop()
+        var right = ""
+        if "fish_right_prompt" in FUNCS or try_autoload("fish_right_prompt") {
+            OUTBUF.push("")
+            call_function(FUNCS["fish_right_prompt"], ["fish_right_prompt"])
+            right = OUTBUF.pop().replace("\n", "")
+        }
+        STATUS = saved
+        return [left, right]
+    }
+    let arrow = STATUS == 0 ? "\e[32m" : "\e[31m"
+    let left = "\e[92m" + os.user() + "\e[0m " + arrow + "❯\e[0m "
+    let b = git_branch()
+    return [left, b == "" ? "" : "\e[35m" + b + "\e[0m"]
+}
+
+fn strip_ansi(s) {
+    let cs = s.chars()
+    var o = ""
+    var i = 0
+    while i < len(cs) {
+        if cs[i] == "\e" and i + 1 < len(cs) and cs[i + 1] == "[" {
+            i += 2
+            while i < len(cs) and not ("@" <= cs[i] and cs[i] <= "~") {
+                i += 1
+            }
+            i += 1
+            continue
+        }
+        o = o + cs[i]
+        i += 1
+    }
+    return o
+}
+
+// a new prompt fades in from dark grey (skipped when keys are waiting)
+fn animate_prompt(ptail) {
+    if var_get1("spire_animate") == "no" {
+        return
+    }
+    let plain = strip_ansi(ptail)
+    for shade in [237, 240, 244, 248] {
+        if os.key_waiting(0) {
+            break
+        }
+        os.write("\e[?25l\r\e[38;5;${shade}m" + plain + "\e[0m\e[K")
+        os.sleep_ms(15)
+    }
+    os.write("\e[?25h")
+}
+
+// ---------------------------------------------------------------- editor
+
+fn new_state(left, right) {
+    var head = ""
+    var tail = left
+    let k = last_index(left, "\n")
+    if k >= 0 {
+        head = left[:k + 1]
+        tail = left[k + 1:]
+    }
+    return {buf: "", cur: 0, ptail: tail, head: head, right: right, row: 0,
+            menu: null, sel: -1, comp_start: 0, comp_end: 0, hist: 0, hsaved: "", hprefix: ""}
+}
+
+fn suggestion(st) {
+    if st.cur != len(st.buf) or st.buf == "" or st.menu != null {
+        return ""
+    }
+    var i = len(HISTORY) - 1
+    while i >= 0 {
+        let h = HISTORY[i]
+        if h.starts_with(st.buf) and len(h) > len(st.buf) {
+            return h[len(st.buf):]
+        }
+        i -= 1
+    }
+    return ""
+}
+
+fn redraw(st, final = false) {
+    let W = os.term_size()[0]
+    var o = "\e[?25l"
+    if st.row > 0 {
+        o = o + "\e[${st.row}A"
+    }
+    o = o + "\r" + st.ptail + highlight(st.buf)
+    let pw = os.width(st.ptail)
+    var total = pw + os.width(st.buf)
+    let sugg = final ? "" : suggestion(st)
+    if sugg != "" {
+        o = o + C_SUGGEST + sugg + RESET
+        total += os.width(sugg)
+    }
+    var rp = false
+    let rw = os.width(st.right)
+    if st.right != "" and rw > 0 and total + rw + 2 <= W {
+        o = o + "\e[K\e[${W - rw}G" + st.right + RESET
+        rp = true
+    }
+    if not rp and total > 0 and total % W == 0 {
+        o = o + " \b"
+    }
+    o = o + "\e[J"
+    let end_row = rp ? 0 : total / W
+    var menu_lines = 0
+    if st.menu != null and not final {
+        let m = render_menu(st, W)
+        o = o + "\r\n" + m.text
+        menu_lines = m.lines
+    }
+    let cur_cols = final ? total : pw + os.width(st.buf[:st.cur])
+    let trow = cur_cols / W
+    let tcol = cur_cols % W
+    let now_row = end_row + menu_lines
+    if now_row > trow {
+        o = o + "\e[${now_row - trow}A"
+    }
+    o = o + "\r"
+    if tcol > 0 {
+        o = o + "\e[${tcol}C"
+    }
+    o = o + "\e[?25h"
+    st.row = trow
+    os.write(o)
+}
+
+fn insert(st, text) {
+    st.buf = st.buf[:st.cur] + text + st.buf[st.cur:]
+    st.cur += len(text)
+}
+
+// fish abbreviation in command position, right before the cursor
+fn expand_abbr(st) {
+    var s = st.cur
+    while s > 0 and not (st.buf[s - 1] in [" ", ";", "|", "&"]) {
+        s -= 1
+    }
+    let w = st.buf[s:st.cur]
+    if not (w in ABBRS) {
+        return
+    }
+    var b = s
+    while b > 0 and st.buf[b - 1] == " " {
+        b -= 1
+    }
+    if b > 0 and not (st.buf[b - 1] in [";", "|", "&"]) {
+        return
+    }
+    st.buf = st.buf[:s] + ABBRS[w] + st.buf[st.cur:]
+    st.cur = s + len(ABBRS[w])
+}
+
+fn hist_move(st, dir) {
+    if st.hist == 0 and dir > 0 {
+        st.hsaved = st.buf
+        st.hprefix = st.buf
+    }
+    var k = st.hist
+    loop {
+        k += dir
+        if k <= 0 {
+            st.hist = 0
+            st.buf = st.hsaved
+            st.cur = len(st.buf)
+            return
+        }
+        if k > len(HISTORY) {
+            os.write("\a")
+            return
+        }
+        let h = HISTORY[len(HISTORY) - k]
+        if h.starts_with(st.hprefix) and h != st.buf {
+            st.hist = k
+            st.buf = h
+            st.cur = len(h)
+            return
+        }
+    }
+}
+
+fn reverse_search(st) {
+    var q = ""
+    var hit = ""
+    loop {
+        os.write("\r\e[J\e[36m(reverse-i-search)\e[0m`" + q + "': " + hit)
+        let k = os.read_key()
+        if k == "" or k == ctrl("g") or k == ctrl("c") or k == "\e" {
+            break
+        }
+        if k == "\r" or k == "\n" {
+            if hit != "" {
+                st.buf = hit
+                st.cur = len(hit)
+            }
+            break
+        }
+        if k == "\x7f" or k == ctrl("h") {
+            q = len(q) > 0 ? q[:-1] : q
+        } elif len(k) == 1 and os.ord(k) >= 32 {
+            q = q + k
+        }
+        hit = ""
+        if q != "" {
+            var i = len(HISTORY) - 1
+            while i >= 0 {
+                if HISTORY[i].index_of(q) >= 0 {
+                    hit = HISTORY[i]
+                    break
+                }
+                i -= 1
+            }
+        }
+    }
+    os.write("\r\e[J")
+    st.row = 0
+}
+
+// reads one line; null at end of input (Ctrl-D on an empty line)
+fn read_line_interactive(left, right, animate) {
+    raw_mode(true)
+    var st = new_state(left, right)
+    if st.head != "" {
+        os.write(st.head.replace("\n", "\r\n"))
+    }
+    if animate {
+        animate_prompt(st.ptail)
+    }
+    redraw(st)
+    EDIT = st
+    loop {
+        let k = next_key(st)
+        if k == "" {
+            raw_mode(false)
+            EDIT = null
+            return null
+        }
+        if st.menu != null and k != "\t" and k != "\e[Z" {
+            let selecting = st.sel >= 0
+            st.menu = null
+            st.sel = -1
+            if selecting and (k == "\r" or k == "\n") {
+                redraw(st)
+                continue
+            }
+        }
+        if k == "\r" or k == "\n" {
+            expand_abbr(st)
+            st.cur = len(st.buf)
+            redraw(st, true)
+            os.write("\r\n")
+            raw_mode(false)
+            EDIT = null
+            return st.buf
+        }
+        if k == ctrl("c") {
+            st.cur = len(st.buf)
+            redraw(st, true)
+            os.write("\e[90m^C\e[0m\r\n")
+            st.buf = ""
+            st.cur = 0
+            st.row = 0
+            st.hist = 0
+        } elif k == ctrl("d") {
+            if st.buf == "" {
+                raw_mode(false)
+                EDIT = null
+                return null
+            }
+            st.buf = st.buf[:st.cur] + st.buf[st.cur + 1:]
+        } elif k == "\x7f" or k == ctrl("h") {
+            if st.cur > 0 {
+                st.buf = st.buf[:st.cur - 1] + st.buf[st.cur:]
+                st.cur -= 1
+            }
+        } elif k == "\e[3~" {
+            st.buf = st.buf[:st.cur] + st.buf[st.cur + 1:]
+        } elif k == ctrl("a") or k == "\e[H" or k == "\eOH" or k == "\e[1~" {
+            st.cur = 0
+        } elif k == ctrl("e") or k == "\e[F" or k == "\eOF" or k == "\e[4~" {
+            st.buf = st.buf + suggestion(st)
+            st.cur = len(st.buf)
+        } elif k == "\e[D" or k == ctrl("b") {
+            st.cur = max(0, st.cur - 1)
+        } elif k == "\e[C" or k == ctrl("f") {
+            if st.cur < len(st.buf) {
+                st.cur += 1
+            } else {
+                st.buf = st.buf + suggestion(st)
+                st.cur = len(st.buf)
+            }
+        } elif k == "\e[1;5C" or k == "\e[1;3C" or k == "\ef" {
+            if st.cur == len(st.buf) and suggestion(st) != "" {
+                // accept one word of the suggestion
+                let s = suggestion(st)
+                var j = 0
+                while j < len(s) and s[j] == " " {
+                    j += 1
+                }
+                while j < len(s) and s[j] != " " {
+                    j += 1
+                }
+                insert(st, s[:j])
+            } else {
+                while st.cur < len(st.buf) and st.buf[st.cur] == " " {
+                    st.cur += 1
+                }
+                while st.cur < len(st.buf) and st.buf[st.cur] != " " {
+                    st.cur += 1
+                }
+            }
+        } elif k == "\e[1;5D" or k == "\e[1;3D" or k == "\eb" {
+            while st.cur > 0 and st.buf[st.cur - 1] == " " {
+                st.cur -= 1
+            }
+            while st.cur > 0 and st.buf[st.cur - 1] != " " {
+                st.cur -= 1
+            }
+        } elif k == "\e[A" or k == ctrl("p") {
+            hist_move(st, 1)
+        } elif k == "\e[B" or k == ctrl("n") {
+            hist_move(st, -1)
+        } elif k == ctrl("u") {
+            st.buf = st.buf[st.cur:]
+            st.cur = 0
+        } elif k == ctrl("k") {
+            st.buf = st.buf[:st.cur]
+        } elif k == ctrl("w") {
+            var s = st.cur
+            while s > 0 and st.buf[s - 1] == " " {
+                s -= 1
+            }
+            while s > 0 and st.buf[s - 1] != " " {
+                s -= 1
+            }
+            st.buf = st.buf[:s] + st.buf[st.cur:]
+            st.cur = s
+        } elif k == ctrl("l") {
+            os.write("\e[H\e[2J")
+            if st.head != "" {
+                os.write(st.head.replace("\n", "\r\n"))
+            }
+            st.row = 0
+        } elif k == ctrl("r") {
+            reverse_search(st)
+        } elif k == "\t" {
+            complete(st, 1)
+            continue
+        } elif k == "\e[Z" {
+            complete(st, -1)
+            continue
+        } elif k == " " {
+            expand_abbr(st)
+            insert(st, " ")
+        } elif len(k) == 1 and os.ord(k) < 32 {
+            // other control keys: ignored
+        } elif not k.starts_with("\e") {
+            insert(st, k)
+        }
+        redraw(st)
+    }
+}
+
+// ---------------------------------------------------------------- completion
+
+fn escape_word(w) {
+    var o = ""
+    for c in w.chars() {
+        if c in [" ", "'", "\"", "\\", "&", ";", "|", "(", ")", "<", ">", "$", "*", "?"] {
+            o = o + "\\"
+        }
+        o = o + c
+    }
+    return o
+}
+
+// candidates for the word before the cursor: [{text, kind}]
+fn candidates(st) {
+    var s = st.cur
+    while s > 0 and not (st.buf[s - 1] in [" ", ";", "|", "&", "(", ">", "<"]) or (s > 1 and st.buf[s - 2] == "\\") {
+        if s == 0 {
+            break
+        }
+        s -= 1
+    }
+    st.comp_start = s
+    st.comp_end = st.cur
+    let raw = st.buf[s:st.cur]
+    let word = raw.replace("\\", "")
+    var b = s
+    while b > 0 and st.buf[b - 1] == " " {
+        b -= 1
+    }
+    let cmd_pos = b == 0 or st.buf[b - 1] in [";", "|", "&", "("]
+    var out = []
+    if word.starts_with("$") {
+        for n in keys(GLOBALS) {
+            if ("$" + n).starts_with(word) {
+                out.push({text: "$" + n, kind: "var"})
+            }
+        }
+        return out
+    }
+    if cmd_pos and word.index_of("/") < 0 {
+        var seen = {}
+        for n in keys(BUILTINS) + keys(FUNCS) + keys(ALIASES) + keys(ABBRS) + keys(path_cmds()) {
+            if n.starts_with(word) and not (n in seen) {
+                seen[n] = true
+                out.push({text: n, kind: "cmd"})
+            }
+        }
+        return out
+    }
+    // the command's completion rules / options from --help
+    let seg = st.buf[:s]
+    var seg_start = 0
+    for sep in [";", "|", "&", "("] {
+        let k = last_index(seg, sep)
+        if k + 1 > seg_start {
+            seg_start = k + 1
+        }
+    }
+    let words = [w for w in seg[seg_start:].split(" ") if w != ""]
+    if len(words) > 0 {
+        let rc = rule_candidates(words[0], words, word, st.buf, st.cur)
+        if rc != null {
+            if rc.nofiles or len(rc.cands) > 0 {
+                if not rc.nofiles {
+                    return rc.cands + file_candidates(st, word)
+                }
+                return rc.cands
+            }
+        }
+    }
+    return file_candidates(st, word)
+}
+
+fn file_candidates(st, word) {
+    var out = []
+    // files
+    var dir = ""
+    var base = word
+    let slash = last_index(word, "/")
+    if slash >= 0 {
+        dir = word[:slash + 1]
+        base = word[slash + 1:]
+    }
+    var real = dir == "" ? "." : dir
+    if real.starts_with("~/") or real == "~/" {
+        real = os.home() + real[1:]
+    }
+    let names = os.listdir(real) ?? []
+    let first_word = st.buf.trim().split(" ")[0]
+    let dirs_only = first_word == "cd" or first_word == "pushd" or first_word == "rmdir"
+    for nm in names {
+        if not nm.starts_with(base) or (nm.starts_with(".") and not base.starts_with(".")) {
+            continue
+        }
+        let info = os.stat(real + "/" + nm)
+        let is_d = info != null and info.dir
+        if dirs_only and not is_d {
+            continue
+        }
+        out.push({text: dir + nm + (is_d ? "/" : ""), kind: is_d ? "dir" : (info != null and info.exec ? "exec" : "file")})
+    }
+    return out
+}
+
+fn common_prefix(list) {
+    if len(list) == 0 {
+        return ""
+    }
+    var p = list[0].text
+    for c in list {
+        var j = 0
+        while j < len(p) and j < len(c.text) and p[j] == c.text[j] {
+            j += 1
+        }
+        p = p[:j]
+    }
+    return p
+}
+
+fn replace_word(st, text) {
+    st.buf = st.buf[:st.comp_start] + text + st.buf[st.comp_end:]
+    st.cur = st.comp_start + len(text)
+    st.comp_end = st.cur
+}
+
+fn complete(st, dir) {
+    if st.menu != null {
+        // Tab again: walk through the menu
+        let n = len(st.menu)
+        st.sel = st.sel < 0 ? (dir > 0 ? 0 : n - 1) : (st.sel + dir + n) % n
+        let c = st.menu[st.sel]
+        replace_word(st, c.kind == "var" ? c.text : escape_word(c.text))
+        redraw(st)
+        return
+    }
+    let cands = candidates(st)
+    if len(cands) == 0 {
+        os.write("\a")
+        return
+    }
+    if len(cands) == 1 {
+        let c = cands[0]
+        let t = c.kind == "var" ? c.text : escape_word(c.text)
+        replace_word(st, t + (t.ends_with("/") ? "" : " "))
+        redraw(st)
+        return
+    }
+    let p = common_prefix(cands)
+    if len(p) > len(st.buf[st.comp_start:st.comp_end].replace("\\", "")) {
+        replace_word(st, escape_word(p))
+    }
+    st.menu = cands.sort(|c| c.text)
+    st.sel = -1
+    redraw(st)
+}
+
+// what the menu shows: the last path component ("src/" for a directory)
+fn menu_name(t) {
+    if t.ends_with("/") {
+        return t[last_index(t[:-1], "/") + 1:]
+    }
+    return t[last_index(t, "/") + 1:]
+}
+
+fn render_menu(st, W) {
+    let names = [menu_name(c.text) for c in st.menu]
+    var width = 1
+    var dwidth = 0
+    for i in 0..len(names) {
+        width = max(width, os.width(names[i]) + 2)
+        let d = st.menu[i].desc ?? ""
+        if d != "" {
+            dwidth = max(dwidth, min(40, os.width(d)) + 4)
+        }
+    }
+    let cell = min(width + dwidth, W - 1)
+    let cols = max(1, (W - 1) / cell)
+    let rows = (len(names) + cols - 1) / cols
+    let shown = min(rows, 10)
+    var text = ""
+    for r in 0..shown {
+        if r > 0 {
+            text = text + "\r\n"
+        }
+        for c in 0..cols {
+            let i = c * rows + r
+            if i >= len(names) {
+                break
+            }
+            let kind = st.menu[i].kind
+            let color = kind == "dir" ? "\e[1;34m" : kind == "exec" ? "\e[1;32m" : kind == "var" ? "\e[96m" : kind == "option" ? "\e[36m" : ""
+            let sel = i == st.sel ? "\e[7m" : ""
+            let nm = names[i]
+            var used = os.width(nm)
+            text = text + sel + color + nm + RESET
+            let d = st.menu[i].desc ?? ""
+            if d != "" and dwidth > 0 {
+                let dd = os.width(d) > 40 ? d[:39] + "…" : d
+                text = text + " " * (width - used) + "\e[3;33m(" + dd + ")" + RESET
+                used = width + os.width(dd) + 2
+            }
+            if c + 1 < cols {
+                text = text + " " * max(1, cell - used)
+            }
+        }
+    }
+    var lines = shown
+    if rows > shown {
+        text = text + "\r\n\e[90m… and ${len(names) - shown * cols} more\e[0m"
+        lines += 1
+    }
+    return {text: text, lines: lines}
+}

@@ -1,0 +1,555 @@
+// expand.zxx - turns a raw word into argument strings: quotes, \escapes,
+// ~, $var / ${var} / ${var:-default} / ${#var}, fish lists ($list[2]),
+// $(cmd) and fish's (cmd), {a,b} braces, and * ? [..] globs.
+
+fn is_name_char(c) {
+    return c == "_" or ("a" <= c and c <= "z") or ("A" <= c and c <= "Z") or ("0" <= c and c <= "9")
+}
+
+// {a,b,c} and {1..5}, quote-aware, one level per pass (recursive)
+fn brace_expand(w) {
+    let cs = w.chars()
+    var sq = false
+    var dq = false
+    var i = 0
+    while i < len(cs) {
+        let c = cs[i]
+        if c == "\\" {
+            i += 2
+            continue
+        }
+        if c == "'" and not dq {
+            sq = not sq
+        } elif c == "\"" and not sq {
+            dq = not dq
+        } elif c == "{" and not sq and not dq and not (i > 0 and cs[i - 1] == "$") {
+            var depth = 0
+            var j = i
+            var commas = []
+            while j < len(cs) {
+                if cs[j] == "{" {
+                    depth += 1
+                } elif cs[j] == "}" {
+                    depth -= 1
+                    if depth == 0 {
+                        break
+                    }
+                } elif cs[j] == "," and depth == 1 {
+                    commas.push(j)
+                }
+                j += 1
+            }
+            if j < len(cs) {
+                let pre = join(cs[:i], "")
+                let post = join(cs[j + 1:], "")
+                let body = join(cs[i + 1:j], "")
+                var alts = []
+                if len(commas) > 0 {
+                    var start = i + 1
+                    for k in commas {
+                        alts.push(join(cs[start:k], ""))
+                        start = k + 1
+                    }
+                    alts.push(join(cs[start:j], ""))
+                } elif body.index_of("..") > 0 {
+                    let parts = body.split("..")
+                    try {
+                        let a = int(parts[0])
+                        let b = int(parts[1])
+                        let step = a <= b ? 1 : -1
+                        var x = a
+                        loop {
+                            alts.push(str(x))
+                            if x == b {
+                                break
+                            }
+                            x += step
+                        }
+                    } catch e {
+                        alts = []
+                    }
+                }
+                if len(alts) > 0 {
+                    var out = []
+                    for a in alts {
+                        for r in brace_expand(pre + a + post) {
+                            out.push(r)
+                        }
+                    }
+                    return out
+                }
+            }
+        }
+        i += 1
+    }
+    return [w]
+}
+
+// value(s) of $name, then fish [index] if present; returns {vals, next}
+fn read_var(cs, i) {
+    var j = i
+    if j < len(cs) and (cs[j] == "?" or cs[j] == "#" or cs[j] == "@" or cs[j] == "*" or cs[j] == "$") {
+        let c = cs[j]
+        if c == "?" {
+            return {vals: [str(STATUS)], next: j + 1}
+        }
+        if c == "$" {
+            return {vals: [str(os.pid())], next: j + 1}
+        }
+        let argv = var_lookup("argv") ?? []
+        if c == "#" {
+            return {vals: [str(len(argv))], next: j + 1}
+        }
+        return {vals: argv, next: j + 1, list: c == "@", star: c == "*"}
+    }
+    if j < len(cs) and "0" <= cs[j] and cs[j] <= "9" {
+        let n = int(cs[j])
+        let argv = var_lookup("argv") ?? []
+        if n == 0 {
+            return {vals: ["spire"], next: j + 1}
+        }
+        return {vals: n <= len(argv) ? [argv[n - 1]] : [], next: j + 1}
+    }
+    while j < len(cs) and is_name_char(cs[j]) {
+        j += 1
+    }
+    if j == i {
+        return null
+    }
+    let name = join(cs[i:j], "")
+    var vals = var_lookup(name) ?? []
+    // fish list index: $list[1], $list[-1], $list[2..3]
+    if j < len(cs) and cs[j] == "[" {
+        var k = j + 1
+        while k < len(cs) and cs[k] != "]" {
+            k += 1
+        }
+        if k < len(cs) {
+            let spec = join(cs[j + 1:k], "")
+            try {
+                var picked = []
+                for part in spec.split(" ") {
+                    if part == "" {
+                        continue
+                    }
+                    var a = 0
+                    var b = 0
+                    if part.index_of("..") >= 0 {
+                        let ab = part.split("..")
+                        a = int(ab[0])
+                        b = int(ab[1])
+                    } else {
+                        a = int(part)
+                        b = a
+                    }
+                    let n = len(vals)
+                    if a < 0 {
+                        a = n + a + 1
+                    }
+                    if b < 0 {
+                        b = n + b + 1
+                    }
+                    if part.index_of("..") >= 0 and (a > n or a < 1) {
+                        continue // fish: a slice starting outside the list is empty
+                    }
+                    let step = a <= b ? 1 : -1
+                    var x = a
+                    loop {
+                        if x >= 1 and x <= n {
+                            picked.push(vals[x - 1])
+                        }
+                        if x == b {
+                            break
+                        }
+                        x += step
+                    }
+                }
+                vals = picked
+                j = k + 1
+            } catch e {
+                // not an index: leave the bracket as text
+            }
+        }
+    }
+    return {vals: vals, next: j}
+}
+
+// ${...}
+fn brace_var(inner) {
+    if inner.starts_with("!") and len(inner) > 1 {
+        // ${!name}: the variable named by $name
+        let target = var_get1(inner[1:])
+        return target == "" ? [] : brace_var(target)
+    }
+    if inner.starts_with("#") and len(inner) > 1 {
+        let rest = inner[1:]
+        let br = rest.index_of("[")
+        if br > 0 {
+            // ${#arr[@]} counts elements, ${#arr[i]} measures one
+            let idx = rest[br + 1:rest.index_of("]")]
+            let v = var_lookup(rest[:br]) ?? []
+            if idx == "@" or idx == "*" {
+                return [str(len(v))]
+            }
+            let el = bash_index(v, idx)
+            return [str(len(el ?? ""))]
+        }
+        let v = var_lookup(rest) ?? []
+        if len(v) > 1 {
+            return [str(len(v))]
+        }
+        return [str(len(join(v, " ")))]
+    }
+    var j = 0
+    while j < len(inner) and (is_name_char(inner[j]) or (j == 0 and inner[j] in ["@", "*", "?", "#"])) {
+        j += 1
+    }
+    let name = inner[:j]
+    var op = inner[j:]
+    var v = name == "@" or name == "*" ? (var_lookup("argv") ?? []) : (var_lookup(name) ?? [])
+    if op.starts_with("[") and op.index_of("]") > 0 {
+        // bash arrays: ${arr[@]} every element, ${arr[i]} one (from 0)
+        let close = op.index_of("]")
+        let idx = op[1:close]
+        op = op[close + 1:]
+        if not (idx == "@" or idx == "*") {
+            let el = bash_index(v, idx)
+            v = el == null ? [] : [el]
+        }
+    }
+    if op.starts_with(":-") or op.starts_with(":=") or op.starts_with(":+") or op.starts_with(":?") or
+       (op != "" and op[0] in ["-", "=", "+", "?"]) {
+        let colon = op.starts_with(":")
+        let kind = colon ? op[1] : op[0]
+        let word = op[colon ? 2 : 1:]
+        let unset = var_lookup(name) == null
+        let empty = unset or (colon and join(v, "") == "")
+        if kind == "-" {
+            return empty ? expand_one_text(word) : v
+        }
+        if kind == "=" {
+            if empty {
+                var_set(name, expand_one_text(word))
+            }
+            return var_lookup(name)
+        }
+        if kind == "+" {
+            return empty ? [] : expand_one_text(word)
+        }
+        if kind == "?" and empty {
+            err("${name}: " + (word == "" ? "parameter not set" : join(expand_one_text(word), "")))
+            return []
+        }
+        return v
+    }
+    if op == "" {
+        return v
+    }
+    return [param_op(x, op) for x in v]
+}
+
+// arr[i] with bash's 0-based (and negative-from-the-end) indices
+fn bash_index(v, idx) {
+    var i = 0
+    try {
+        i = arith_eval(idx)
+    } catch e {
+        return null
+    }
+    if i < 0 {
+        i = len(v) + i
+    }
+    return i >= 0 and i < len(v) ? v[i] : null
+}
+
+fn expand_one_text(word) {
+    return [join(expand_word(word), " ")]
+}
+
+fn capture_cmd(src) {
+    let out = run_capture(src)
+    var s = out
+    while s.ends_with("\n") {
+        s = s[:-1]
+    }
+    return s
+}
+
+// "(cmd)" or "$(cmd)": cs[i] is "("; -> {text, next}
+fn scan_parens(cs, i) {
+    var depth = 0
+    var j = i
+    var sq = false
+    var dq = false
+    while j < len(cs) {
+        let c = cs[j]
+        if c == "\\" {
+            j += 2
+            continue
+        }
+        if c == "'" and not dq {
+            sq = not sq
+        } elif c == "\"" and not sq {
+            dq = not dq
+        } elif not sq and c == "(" {
+            depth += 1
+        } elif not sq and c == ")" {
+            depth -= 1
+            if depth == 0 {
+                break
+            }
+        }
+        j += 1
+    }
+    return {text: join(cs[i + 1:j], ""), next: j + 1}
+}
+
+// Expands one raw word to zero or more arguments.
+fn expand_word(raw, noglob = false) {
+    var out = []
+    for w in brace_expand(raw) {
+        for x in expand_simple(w, noglob) {
+            out.push(x)
+        }
+    }
+    return out
+}
+
+fn expand_simple(raw, noglob = false) {
+    let cs = raw.chars()
+    let n = len(cs)
+    // words so far, each a pair: [text, glob_pattern_or_null]
+    var words = [""]
+    var pat = [""]
+    var globbing = false
+    var any = false
+    var i = 0
+    if n > 0 and cs[0] == "~" and (n == 1 or cs[1] == "/") {
+        words[-1] = os.home()
+        pat[-1] = os.home()
+        i = 1
+        any = true
+    }
+    // appends text to the current word (quoted text can't glob)
+    let add = fn(text, quoted) {
+        words[-1] = words[-1] + text
+        if quoted {
+            var esc = ""
+            for c in text.chars() {
+                esc = esc + (c in ["*", "?", "["] ? "[" + c + "]" : c)
+            }
+            pat[-1] = pat[-1] + esc
+        } else {
+            pat[-1] = pat[-1] + text
+        }
+    }
+    // a list value splits into separate words (fish semantics)
+    let add_list = fn(vals) {
+        var k = 0
+        for v in vals {
+            if k > 0 {
+                words.push("")
+                pat.push("")
+            }
+            add(v, true)
+            k += 1
+        }
+        any = any or len(vals) > 0
+    }
+    while i < n {
+        let c = cs[i]
+        if c == "'" {
+            var j = i + 1
+            var t = ""
+            while j < n and cs[j] != "'" {
+                if cs[j] == "\\" and j + 1 < n and (cs[j + 1] == "'" or cs[j + 1] == "\\") {
+                    j += 1
+                }
+                t = t + cs[j]
+                j += 1
+            }
+            add(t, true)
+            any = true
+            i = j + 1
+            continue
+        }
+        if c == "\"" {
+            var j = i + 1
+            var t = ""
+            while j < n and cs[j] != "\"" {
+                let d = cs[j]
+                if d == "\\" and j + 1 < n and cs[j + 1] in ["\"", "\\", "$", "`"] {
+                    t = t + cs[j + 1]
+                    j += 2
+                    continue
+                }
+                if d == "$" and j + 2 < n and cs[j + 1] == "(" and cs[j + 2] == "(" {
+                    let p = scan_parens(cs, j + 1)
+                    t = t + arith_text(p.text[1:-1])
+                    j = p.next
+                    continue
+                }
+                if d == "$" and j + 1 < n {
+                    if cs[j + 1] == "(" {
+                        let p = scan_parens(cs, j + 1)
+                        t = t + capture_cmd(p.text)
+                        j = p.next
+                        continue
+                    }
+                    if cs[j + 1] == "{" {
+                        var k = j + 2
+                        while k < n and cs[k] != "}" {
+                            k += 1
+                        }
+                        t = t + join(brace_var(join(cs[j + 2:k], "")), " ")
+                        j = k + 1
+                        continue
+                    }
+                    let r = read_var(cs, j + 1)
+                    if r != null {
+                        if (r.list ?? false) and len(r.vals) > 0 {
+                            // "$@": each argument stays separate
+                            add(t, true)
+                            t = ""
+                            add_list(r.vals)
+                        } else {
+                            t = t + join(r.vals, " ")
+                        }
+                        j = r.next
+                        continue
+                    }
+                }
+                t = t + d
+                j += 1
+            }
+            add(t, true)
+            any = true
+            i = j + 1
+            continue
+        }
+        if c == "\\" and i + 1 < n {
+            let e = cs[i + 1]
+            add(e == "n" ? "\n" : e == "t" ? "\t" : e == "e" ? "\e" : e, true)
+            any = true
+            i += 2
+            continue
+        }
+        if c == "$" and i + 2 < n and cs[i + 1] == "(" and cs[i + 2] == "(" {
+            let p = scan_parens(cs, i + 1)
+            add(arith_text(p.text[1:-1]), true)
+            any = true
+            i = p.next
+            continue
+        }
+        if c == "$" and i + 1 < n {
+            if cs[i + 1] == "(" {
+                let p = scan_parens(cs, i + 1)
+                let text = capture_cmd(p.text)
+                add_list(text == "" ? [] : text.split("\n"))
+                i = p.next
+                continue
+            }
+            if cs[i + 1] == "{" {
+                var k = i + 2
+                while k < n and cs[k] != "}" {
+                    k += 1
+                }
+                add_list(brace_var(join(cs[i + 2:k], "")))
+                i = k + 1
+                continue
+            }
+            let r = read_var(cs, i + 1)
+            if r != null {
+                if r.star ?? false {
+                    add(join(r.vals, " "), true)
+                    any = true
+                } else {
+                    add_list(r.vals)
+                }
+                i = r.next
+                continue
+            }
+        }
+        if (c == "<" or c == ">") and i + 1 < n and cs[i + 1] == "(" {
+            // <(cmd) / >(cmd): the command's output (or input) as a file name
+            let p = scan_parens(cs, i + 1)
+            add(process_substitution(p.text, c == "<"), true)
+            any = true
+            i = p.next
+            continue
+        }
+        if c == "(" {
+            // fish command substitution: one argument per output line
+            let p = scan_parens(cs, i)
+            let text = capture_cmd(p.text)
+            add_list(text == "" ? [] : text.split("\n"))
+            i = p.next
+            continue
+        }
+        if c == "*" or c == "?" or c == "[" {
+            globbing = true
+        }
+        add(c, false)
+        any = true
+        i += 1
+    }
+    if not any {
+        return []
+    }
+    if not globbing or noglob {
+        return words
+    }
+    var out = []
+    var k = 0
+    for w in words {
+        let matches = os.glob(pat[k])
+        if len(matches) > 0 {
+            for m in matches {
+                out.push(m)
+            }
+        } else {
+            out.push(w)
+        }
+        k += 1
+    }
+    return out
+}
+
+// here-document text: $var, ${...}, $(cmd) and $((...)) expand; quotes are
+// ordinary characters; \$ \` \\ escape
+fn expand_heredoc(text) {
+    let wrapped = "\"" + text.replace("\"", "\\\"") + "\""
+    return join(expand_word(wrapped, true), " ")
+}
+
+var PROCSUB_FDS = []
+
+fn process_substitution(src, reading) {
+    let p = os.pipe()
+    let pid = os.fork()
+    if pid == 0 {
+        if reading {
+            os.dup2(p[1], 1)
+        } else {
+            os.dup2(p[0], 0)
+        }
+        os.close(p[0])
+        os.close(p[1])
+        OUTBUF = []
+        INPUT = []
+        let st = run_source(src)
+        os.exit(st)
+    }
+    let keep = reading ? p[0] : p[1]
+    os.close(reading ? p[1] : p[0])
+    os.inherit(keep)
+    PROCSUB_FDS.push(keep)
+    return "/dev/fd/" + str(keep)
+}
+
+fn close_procsubs() {
+    for fd in PROCSUB_FDS {
+        os.close(fd)
+    }
+    PROCSUB_FDS = []
+}

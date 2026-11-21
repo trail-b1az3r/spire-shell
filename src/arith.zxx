@@ -1,0 +1,746 @@
+// arith.zxx - $(( )) / (( )) arithmetic, [[ ]] / test conditions, and
+// bash's ${var#pattern} family of parameter operators.
+
+// ---------------------------------------------------------------- arithmetic
+
+fn arith_tokens(src) {
+    let cs = src.chars()
+    var toks = []
+    var i = 0
+    let ops3 = ["**=", "<<=", ">>="]
+    let ops2 = ["**", "<<", ">>", "<=", ">=", "==", "!=", "&&", "||", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "++", "--"]
+    while i < len(cs) {
+        let c = cs[i]
+        if c == " " or c == "\t" or c == "\n" {
+            i += 1
+            continue
+        }
+        if "0" <= c and c <= "9" {
+            var j = i
+            while j < len(cs) and is_name_char(cs[j]) {
+                j += 1
+            }
+            toks.push({t: "num", v: join(cs[i:j], "")})
+            i = j
+            continue
+        }
+        if is_name_char(c) or c == "$" {
+            var j = c == "$" ? i + 1 : i
+            let start = j
+            while j < len(cs) and is_name_char(cs[j]) {
+                j += 1
+            }
+            toks.push({t: "name", v: join(cs[start:j], "")})
+            i = j
+            continue
+        }
+        var op = c
+        let s3 = join(cs[i:i + 3], "")
+        let s2 = join(cs[i:i + 2], "")
+        if s3 in ops3 {
+            op = s3
+        } elif s2 in ops2 {
+            op = s2
+        }
+        toks.push({t: "op", v: op})
+        i += len(op)
+    }
+    return toks
+}
+
+fn parse_int(s) {
+    var t = s
+    var neg = false
+    if t.starts_with("-") {
+        neg = true
+        t = t[1:]
+    }
+    var v = 0
+    if t.starts_with("0x") or t.starts_with("0X") {
+        v = hex_val(t[2:])
+    } elif len(t) > 1 and t.starts_with("0") {
+        for c in t[1:].chars() {
+            v = v * 8 + int(c)
+        }
+    } else {
+        v = int(t == "" ? "0" : t)
+    }
+    return neg ? -v : v
+}
+
+fn var_num(name) {
+    let v = var_get1(name).trim()
+    if v == "" {
+        return 0
+    }
+    try {
+        return parse_int(v)
+    } catch e {
+        return arith_eval(v)
+    }
+}
+
+// precedence climbing; S = {toks, pos, skip}: `skip` > 0 while evaluating
+// the side of && || ?: that doesn't count (no assignments happen there)
+fn arith_eval(src) {
+    var S = {toks: arith_tokens(src), pos: 0, skip: 0}
+    if len(S.toks) == 0 {
+        return 0
+    }
+    let v = a_comma(S)
+    if S.pos < len(S.toks) {
+        throw "unexpected '" + S.toks[S.pos].v + "'"
+    }
+    return v
+}
+
+fn a_peek(S) {
+    return S.pos < len(S.toks) ? S.toks[S.pos] : {t: "end", v: ""}
+}
+
+fn a_is(S, v) {
+    let t = a_peek(S)
+    return t.t == "op" and t.v == v
+}
+
+fn a_comma(S) {
+    var v = a_assign(S)
+    while a_is(S, ",") {
+        S.pos += 1
+        v = a_assign(S)
+    }
+    return v
+}
+
+fn a_store(S, name, v) {
+    if S.skip == 0 {
+        var_set(name, [str(v)])
+    }
+    return v
+}
+
+fn a_assign(S) {
+    let t = a_peek(S)
+    if t.t == "name" and S.pos + 1 < len(S.toks) {
+        let o = S.toks[S.pos + 1]
+        if o.t == "op" and o.v in ["=", "+=", "-=", "*=", "/=", "%=", "<<=", ">>=", "&=", "|=", "^=", "**="] {
+            S.pos += 2
+            let r = a_assign(S)
+            if o.v == "=" {
+                return a_store(S, t.v, r)
+            }
+            return a_store(S, t.v, a_binop(o.v[:-1], var_num(t.v), r))
+        }
+    }
+    return a_ternary(S)
+}
+
+fn a_ternary(S) {
+    let c = a_binary(S, 0)
+    if a_is(S, "?") {
+        S.pos += 1
+        if c == 0 {
+            S.skip += 1
+        }
+        let a = a_assign(S)
+        if c == 0 {
+            S.skip -= 1
+        }
+        if not a_is(S, ":") {
+            throw "expected ':'"
+        }
+        S.pos += 1
+        if c != 0 {
+            S.skip += 1
+        }
+        let b = a_assign(S)
+        if c != 0 {
+            S.skip -= 1
+        }
+        return c != 0 ? a : b
+    }
+    return c
+}
+
+const A_PREC = [["||"], ["&&"], ["|"], ["^"], ["&"], ["==", "!="], ["<", "<=", ">", ">="], ["<<", ">>"], ["+", "-"], ["*", "/", "%"]]
+
+fn a_binop(op, a, b) {
+    if op == "+" {
+        return a + b
+    }
+    if op == "-" {
+        return a - b
+    }
+    if op == "*" {
+        return a * b
+    }
+    if op == "/" or op == "%" {
+        if b == 0 {
+            throw "division by zero"
+        }
+        // truncate toward zero, like C
+        var q = abs(a) / abs(b)
+        if (a < 0) != (b < 0) {
+            q = -q
+        }
+        return op == "/" ? q : a - q * b
+    }
+    if op == "**" {
+        return a ** b
+    }
+    if op == "<<" {
+        return a * 2 ** b
+    }
+    if op == ">>" {
+        return floor(a / 2 ** b)
+    }
+    if op == "<" {
+        return a < b ? 1 : 0
+    }
+    if op == "<=" {
+        return a <= b ? 1 : 0
+    }
+    if op == ">" {
+        return a > b ? 1 : 0
+    }
+    if op == ">=" {
+        return a >= b ? 1 : 0
+    }
+    if op == "==" {
+        return a == b ? 1 : 0
+    }
+    if op == "!=" {
+        return a != b ? 1 : 0
+    }
+    if op == "&" or op == "|" or op == "^" {
+        return bitop(op, a, b)
+    }
+    throw "unknown operator ${op}"
+}
+
+fn bitop(op, a, b) {
+    // two's-complement over 62 bits, done with arithmetic
+    var x = a
+    var y = b
+    var r = 0
+    var bit = 1
+    for _ in 0..62 {
+        let xb = x % 2 != 0 ? 1 : 0
+        let yb = y % 2 != 0 ? 1 : 0
+        let rb = op == "&" ? xb * yb : op == "|" ? max(xb, yb) : (xb + yb) % 2
+        r += rb * bit
+        x = floor(x / 2)
+        y = floor(y / 2)
+        bit *= 2
+        if x == 0 and y == 0 {
+            break
+        }
+    }
+    return r
+}
+
+fn a_binary(S, level) {
+    if level >= len(A_PREC) {
+        return a_power(S)
+    }
+    var v = a_binary(S, level + 1)
+    loop {
+        let t = a_peek(S)
+        if t.t != "op" or not (t.v in A_PREC[level]) {
+            break
+        }
+        S.pos += 1
+        if t.v == "&&" or t.v == "||" {
+            let short = (t.v == "&&") == (v == 0)
+            if short {
+                S.skip += 1
+            }
+            let r = a_binary(S, level + 1)
+            if short {
+                S.skip -= 1
+                v = t.v == "&&" ? 0 : 1
+            } else {
+                v = r != 0 ? 1 : 0
+            }
+            continue
+        }
+        v = a_binop(t.v, v, a_binary(S, level + 1))
+    }
+    return v
+}
+
+fn a_power(S) {
+    let b = a_unary(S)
+    if a_is(S, "**") {
+        S.pos += 1
+        return a_binop("**", b, a_power(S))
+    }
+    return b
+}
+
+fn a_unary(S) {
+    let t = a_peek(S)
+    if t.t == "op" {
+        if t.v == "-" {
+            S.pos += 1
+            return -a_unary(S)
+        }
+        if t.v == "+" {
+            S.pos += 1
+            return a_unary(S)
+        }
+        if t.v == "!" {
+            S.pos += 1
+            return a_unary(S) == 0 ? 1 : 0
+        }
+        if t.v == "~" {
+            S.pos += 1
+            return -a_unary(S) - 1
+        }
+        if t.v == "++" or t.v == "--" {
+            S.pos += 1
+            let n = a_peek(S)
+            if n.t != "name" {
+                throw "${t.v} needs a variable"
+            }
+            S.pos += 1
+            return a_store(S, n.v, var_num(n.v) + (t.v == "++" ? 1 : -1))
+        }
+    }
+    return a_postfix(S)
+}
+
+fn a_postfix(S) {
+    let t = a_peek(S)
+    if t.t == "name" {
+        S.pos += 1
+        let v = var_num(t.v)
+        if a_is(S, "++") or a_is(S, "--") {
+            let op = a_peek(S).v
+            S.pos += 1
+            a_store(S, t.v, v + (op == "++" ? 1 : -1))
+        }
+        return v
+    }
+    if t.t == "num" {
+        S.pos += 1
+        return parse_int(t.v)
+    }
+    if a_is(S, "(") {
+        S.pos += 1
+        let v = a_comma(S)
+        if not a_is(S, ")") {
+            throw "expected ')'"
+        }
+        S.pos += 1
+        return v
+    }
+    throw t.t == "end" ? "expression ends too soon" : "unexpected '" + t.v + "'"
+}
+
+// $(( ... )) text -> its value as text (errors are reported, giving "0")
+fn arith_text(expr) {
+    try {
+        return str(arith_eval(expand_heredoc(expr)))
+    } catch e {
+        err("arithmetic: ${e}: ${expr.trim()}")
+        return "0"
+    }
+}
+
+// ---------------------------------------------------------------- conditions
+
+const UNARY_TESTS = ["-e", "-f", "-d", "-r", "-w", "-x", "-s", "-L", "-h", "-z", "-n", "-p", "-S", "-b", "-c", "-t", "-v"]
+const BINARY_TESTS = ["=", "==", "!=", "<", ">", "=~", "-eq", "-ne", "-lt", "-le", "-gt", "-ge", "-nt", "-ot", "-ef"]
+
+fn file_test(op, f) {
+    if op == "-z" {
+        return f == ""
+    }
+    if op == "-n" {
+        return f != ""
+    }
+    if op == "-v" {
+        return var_lookup(f) != null
+    }
+    if op == "-t" {
+        return os.isatty(int(f))
+    }
+    let st = os.stat(f)
+    if st == null {
+        return false
+    }
+    if op == "-e" {
+        return true
+    }
+    if op == "-f" {
+        return st.file
+    }
+    if op == "-d" {
+        return st.dir
+    }
+    if op == "-x" {
+        return st.exec or st.dir
+    }
+    if op == "-s" {
+        return st.size > 0
+    }
+    if op == "-L" or op == "-h" {
+        return st.link
+    }
+    if op == "-r" or op == "-w" {
+        return os.run([["test", op, f]], {}).status == 0
+    }
+    return os.run([["test", op, f]], {}).status == 0
+}
+
+fn mtime_cmp(op, a, b) {
+    return os.run([["test", a, op, b]], {}).status == 0
+}
+
+fn binary_test(a, op, b, patterns) {
+    if op == "=" or op == "==" {
+        return patterns ? os.fnmatch(b, a) : a == b
+    }
+    if op == "!=" {
+        return patterns ? not os.fnmatch(b, a) : a != b
+    }
+    if op == "<" {
+        return a < b
+    }
+    if op == ">" {
+        return a > b
+    }
+    if op == "=~" {
+        let m = os.regex(b, a)
+        var_set("BASH_REMATCH", m ?? [], "global")
+        return m != null
+    }
+    if op == "-nt" or op == "-ot" or op == "-ef" {
+        return mtime_cmp(op, a, b)
+    }
+    let x = arith_eval(a)
+    let y = arith_eval(b)
+    if op == "-eq" {
+        return x == y
+    }
+    if op == "-ne" {
+        return x != y
+    }
+    if op == "-lt" {
+        return x < y
+    }
+    if op == "-le" {
+        return x <= y
+    }
+    if op == "-gt" {
+        return x > y
+    }
+    return x >= y
+}
+
+// tokens are already-expanded strings; and_op/or_op are "&&"/"||" for
+// [[ ]] and "-a"/"-o" for test; `patterns`: == matches globs ([[ ]])
+fn cond_eval(toks, and_op, or_op, patterns) {
+    var S = {toks: toks, pos: 0}
+    let r = c_or(S, and_op, or_op, patterns)
+    if S.pos < len(toks) {
+        throw "unexpected '" + toks[S.pos] + "'"
+    }
+    return r
+}
+
+fn c_or(S, a, o, p) {
+    var v = c_and(S, a, o, p)
+    while S.pos < len(S.toks) and S.toks[S.pos] == o {
+        S.pos += 1
+        let r = c_and(S, a, o, p)
+        v = v or r
+    }
+    return v
+}
+
+fn c_and(S, a, o, p) {
+    var v = c_not(S, a, o, p)
+    while S.pos < len(S.toks) and S.toks[S.pos] == a {
+        S.pos += 1
+        let r = c_not(S, a, o, p)
+        v = v and r
+    }
+    return v
+}
+
+fn c_not(S, a, o, p) {
+    if S.pos < len(S.toks) and S.toks[S.pos] == "!" and S.pos + 1 < len(S.toks) {
+        S.pos += 1
+        return not c_not(S, a, o, p)
+    }
+    return c_atom(S, a, o, p)
+}
+
+fn c_atom(S, a, o, p) {
+    let t = S.toks
+    let i = S.pos
+    let n = len(t)
+    if i >= n {
+        throw "expression ends too soon"
+    }
+    if t[i] == "(" {
+        S.pos += 1
+        let v = c_or(S, a, o, p)
+        if S.pos >= n or t[S.pos] != ")" {
+            throw "expected ')'"
+        }
+        S.pos += 1
+        return v
+    }
+    if i + 2 < n and t[i + 1] in BINARY_TESTS {
+        S.pos += 3
+        return binary_test(t[i], t[i + 1], t[i + 2], p)
+    }
+    if t[i] in UNARY_TESTS and i + 1 < n {
+        S.pos += 2
+        return file_test(t[i], t[i + 1])
+    }
+    S.pos += 1
+    return t[i] != ""
+}
+
+// [[ ... ]]: expand the words (no splitting, no globbing) into tokens
+// the operand of =~: $vars expand, quoted text is literal, and ( ) \ stay regex syntax
+fn expand_regex(w) {
+    let cs = w.chars()
+    var o = ""
+    var i = 0
+    while i < len(cs) {
+        let c = cs[i]
+        if c == "'" or c == "\"" {
+            var j = i + 1
+            var lit = ""
+            while j < len(cs) and cs[j] != c {
+                lit = lit + cs[j]
+                j += 1
+            }
+            if c == "\"" {
+                lit = expand_heredoc(lit)
+            }
+            for ch in lit.chars() {
+                o = o + (ch in [".", "*", "+", "?", "(", ")", "[", "]", "{", "}", "|", "^", "$", "\\"] ? "\\" + ch : ch)
+            }
+            i = j + 1
+            continue
+        }
+        if c == "$" and i + 1 < len(cs) and (is_name_char(cs[i + 1]) or cs[i + 1] == "{") {
+            let r = cs[i + 1] == "{" ? null : read_var(cs, i + 1)
+            if r != null {
+                o = o + join(r.vals, " ")
+                i = r.next
+                continue
+            }
+            var k = i + 2
+            while k < len(cs) and cs[k] != "}" {
+                k += 1
+            }
+            o = o + join(brace_var(join(cs[i + 2:k], "")), " ")
+            i = k + 1
+            continue
+        }
+        o = o + c
+        i += 1
+    }
+    return o
+}
+
+fn cond_tokens(words) {
+    var out = []
+    var k = 0
+    for w in words {
+        k += 1
+        if k >= 2 and words[k - 2] == "=~" {
+            out.push(expand_regex(w))
+            continue
+        }
+        if w in ["&&", "||", "!", "<", ">"] {
+            out.push(w)
+        } elif w.starts_with("(") and w.ends_with(")") and len(w) >= 2 {
+            out.push("(")
+            for x in cond_tokens([t.v for t in lex(w[1:-1]).toks]) {
+                out.push(x)
+            }
+            out.push(")")
+        } else {
+            out.push(join(expand_word(w, true), " "))
+        }
+    }
+    return out
+}
+
+fn run_cond(n) {
+    try {
+        return cond_eval(cond_tokens(n.words), "&&", "||", true) ? 0 : 1
+    } catch e {
+        err("[[: ${e}")
+        return 2
+    }
+}
+
+fn builtin_test(argv) {
+    var args = argv[1:]
+    if argv[0] == "[" {
+        if len(args) == 0 or args[-1] != "]" {
+            err("[: missing ']'")
+            return 2
+        }
+        args = args[:-1]
+    }
+    if len(args) == 0 {
+        return 1
+    }
+    try {
+        return cond_eval(args, "-a", "-o", false) ? 0 : 1
+    } catch e {
+        err("test: ${e}")
+        return 2
+    }
+}
+
+// ---------------------------------------------------------------- ${var op}
+
+fn remove_affix(v, pat, prefix, longest) {
+    let n = len(v)
+    if prefix {
+        var order = longest ? [n - k for k in 0..=n] : [k for k in 0..=n]
+        for k in order {
+            if os.fnmatch(pat, v[:k]) {
+                return v[k:]
+            }
+        }
+    } else {
+        var order = longest ? [k for k in 0..=n] : [n - k for k in 0..=n]
+        for k in order {
+            if os.fnmatch(pat, v[k:]) {
+                return v[:k]
+            }
+        }
+    }
+    return v
+}
+
+fn substitute(v, pat, rep, mode) {
+    // mode: "1" first, "a" all, "#" anchored at start, "%" anchored at end
+    if pat == "" {
+        return v
+    }
+    let n = len(v)
+    var out = ""
+    var i = 0
+    var done = false
+    while i <= n {
+        var hit = -1
+        if not done and (mode != "#" or i == 0) {
+            var e = n
+            while e >= i {
+                if (mode != "%" or e == n) and os.fnmatch(pat, v[i:e]) {
+                    hit = e
+                    break
+                }
+                e -= 1
+            }
+        }
+        if hit >= 0 and hit > i {
+            out = out + rep
+            i = hit
+            if mode != "a" {
+                done = true
+            }
+            continue
+        }
+        if i < n {
+            out = out + v[i]
+        }
+        i += 1
+    }
+    return out
+}
+
+// the operator part of ${name<op>} applied to one value
+fn param_op(v, op) {
+    if op.starts_with("##") {
+        return remove_affix(v, expand_pattern_text(op[2:]), true, true)
+    }
+    if op.starts_with("#") {
+        return remove_affix(v, expand_pattern_text(op[1:]), true, false)
+    }
+    if op.starts_with("%%") {
+        return remove_affix(v, expand_pattern_text(op[2:]), false, true)
+    }
+    if op.starts_with("%") {
+        return remove_affix(v, expand_pattern_text(op[1:]), false, false)
+    }
+    if op.starts_with("/") {
+        var mode = "1"
+        var body = op[1:]
+        if body.starts_with("/") {
+            mode = "a"
+            body = body[1:]
+        } elif body.starts_with("#") {
+            mode = "#"
+            body = body[1:]
+        } elif body.starts_with("%") {
+            mode = "%"
+            body = body[1:]
+        }
+        // split at the first unescaped /
+        var k = -1
+        var q = 0
+        while q < len(body) {
+            if body[q] == "\\" {
+                q += 2
+                continue
+            }
+            if body[q] == "/" {
+                k = q
+                break
+            }
+            q += 1
+        }
+        let pat = (k >= 0 ? body[:k] : body).replace("\\/", "/")
+        let rep = k >= 0 ? body[k + 1:] : ""
+        return substitute(v, expand_pattern_text(pat), expand_pattern_text(rep), mode)
+    }
+    if op == "^^" {
+        return v.upper()
+    }
+    if op == ",," {
+        return v.lower()
+    }
+    if op == "^" {
+        return len(v) > 0 ? v[0].upper() + v[1:] : v
+    }
+    if op == "," {
+        return len(v) > 0 ? v[0].lower() + v[1:] : v
+    }
+    if op.starts_with(":") {
+        // ${v:offset} / ${v:offset:length}
+        let parts = op[1:].split(":")
+        let n = len(v)
+        var off = arith_eval(parts[0])
+        if off < 0 {
+            off = max(0, n + off)
+        }
+        off = min(off, n)
+        var l = n - off
+        if len(parts) > 1 {
+            l = arith_eval(parts[1])
+            if l < 0 {
+                l = max(0, n - off + l)
+            }
+        }
+        return v[off:min(n, off + l)]
+    }
+    return v
+}
+
+fn expand_pattern_text(w) {
+    return join(expand_word(w, true), " ")
+}

@@ -1,0 +1,338 @@
+// complete.zxx - programmable completion: `complete` rules (fish and bash
+// styles), fish completions/*.fish autoloading, `commandline`, and
+// options learned from `CMD --help`.
+
+var RULES = []            // {cmd, short, long, old, args, desc, cond, nofiles, func, words}
+var HELP_CACHE = {}
+var COMP_LOADED = {}
+var CMDLINE = {buf: "", cur: 0}
+
+fn builtin_complete(argv) {
+    var r = {cmd: [], short: null, long: null, old: null, args: null, desc: "", cond: null, nofiles: false, func: null}
+    var erase = false
+    var i = 1
+    while i < len(argv) {
+        let a = argv[i]
+        let v = i + 1 < len(argv) ? argv[i + 1] : null
+        if (a == "-c" or a == "--command") and v != null {
+            r.cmd.push(v)
+            i += 2
+        } elif (a == "-s" or a == "--short-option") and v != null {
+            r.short = v
+            i += 2
+        } elif (a == "-l" or a == "--long-option") and v != null {
+            r.long = v
+            i += 2
+        } elif (a == "-o" or a == "--old-option") and v != null {
+            r.old = v
+            i += 2
+        } elif (a == "-a" or a == "--arguments" or a == "-W") and v != null {
+            r.args = v
+            i += 2
+        } elif (a == "-d" or a == "--description") and v != null {
+            r.desc = v
+            i += 2
+        } elif (a == "-n" or a == "--condition") and v != null {
+            r.cond = v
+            i += 2
+        } elif a == "-F" and v != null {
+            r.func = v
+            i += 2
+        } elif a == "-f" or a == "--no-files" or a == "-x" or a == "--exclusive" {
+            r.nofiles = true
+            i += 1
+        } elif a == "-e" or a == "--erase" or a == "-r" {
+            erase = true
+            i += 1
+        } elif a.starts_with("-") {
+            i += 1 // -k, -r, --wraps ...: accepted
+        } else {
+            r.cmd.push(a) // bash: complete -W "..." CMD
+            i += 1
+        }
+    }
+    if len(r.cmd) == 0 {
+        for x in RULES {
+            outl("complete -c ${x.cmd}" + (x.short != null ? " -s ${x.short}" : "") + (x.long != null ? " -l ${x.long}" : "") +
+                 (x.args != null ? " -a '${x.args}'" : "") + (x.desc != "" ? " -d '${x.desc}'" : ""))
+        }
+        return 0
+    }
+    for c in r.cmd {
+        if erase {
+            RULES = [x for x in RULES if x.cmd != c]
+            continue
+        }
+        RULES.push({cmd: c, short: r.short, long: r.long, old: r.old, args: r.args, desc: r.desc,
+                    cond: r.cond, nofiles: r.nofiles or r.func != null, func: r.func})
+    }
+    return 0
+}
+
+// commandline [-o] [-p] [-c] [-t] [-C]: the line being completed
+fn builtin_commandline(argv) {
+    var tokens = false
+    var cut = false
+    var token = false
+    var cursor = false
+    var mode = "replace"
+    var funcs = false
+    var texts = []
+    var i = 1
+    while i < len(argv) {
+        let a = argv[i]
+        i += 1
+        if a == "--" {
+            texts = texts + argv[i:]
+            break
+        }
+        if a == "-r" or a == "--replace" {
+            mode = "replace"
+        } elif a == "-i" or a == "--insert" {
+            mode = "insert"
+        } elif a == "-a" or a == "--append" {
+            mode = "append"
+        } elif a == "-f" or a == "--function" {
+            funcs = true
+        } elif not a.starts_with("-") or len(a) == 1 {
+            texts.push(a)
+        }
+    }
+    if EDIT != null {
+        CMDLINE = {buf: EDIT.buf, cur: EDIT.cur}
+    }
+    if funcs {
+        for f in texts {
+            for x in INPUT_FUNCTIONS[f] ?? [] {
+                KEYQ.push(x)
+            }
+        }
+        return 0
+    }
+    for a in argv[1:] {
+        if a.starts_with("--") {
+            tokens = tokens or a == "--tokenize" or a == "--tokens-expanded"
+            cut = cut or a == "--cut-at-cursor"
+            token = token or a == "--current-token"
+            cursor = cursor or a == "--cursor"
+        } elif a.starts_with("-") {
+            tokens = tokens or a.index_of("o") >= 0 or a.index_of("x") >= 0
+            cut = cut or a.index_of("c") >= 0
+            token = token or a.index_of("t") >= 0
+            cursor = cursor or a.index_of("C") >= 0
+        }
+    }
+    if cursor and len(texts) > 0 and EDIT != null {
+        EDIT.cur = min(len(EDIT.buf), max(0, int(texts[0])))
+        return 0
+    }
+    if cursor {
+        outl(str(CMDLINE.cur))
+        return 0
+    }
+    if len(texts) > 0 {
+        return commandline_edit(token ? "token" : mode, join(texts, " "))
+    }
+    var text = cut ? CMDLINE.buf[:CMDLINE.cur] : CMDLINE.buf
+    // only the current command
+    for sep in [";", "|", "&"] {
+        let k = last_index(text, sep)
+        if k >= 0 {
+            text = text[k + 1:]
+        }
+    }
+    let words = [w for w in text.split(" ") if w != ""]
+    if token {
+        outl(text.ends_with(" ") or len(words) == 0 ? "" : words[-1])
+        return 0
+    }
+    if tokens {
+        let upto = cut and not text.ends_with(" ") and len(words) > 0 ? len(words) - 1 : len(words)
+        for w in words[:upto] {
+            outl(w)
+        }
+        return 0
+    }
+    outl(text)
+    return 0
+}
+
+// fish's helpers that completion files use
+const FISH_HELPERS = join([
+    "function __fish_seen_subcommand_from",
+    "    set -l words (commandline -opc)",
+    "    for w in \$words[2..-1]",
+    "        contains -- \$w \$argv; and return 0",
+    "    end",
+    "    return 1",
+    "end",
+    "function __fish_use_subcommand",
+    "    set -l words (commandline -opc)",
+    "    for w in \$words[2..-1]",
+    "        string match -q -- '-*' \$w; or return 1",
+    "    end",
+    "    return 0",
+    "end",
+    "function __fish_no_arguments",
+    "    __fish_use_subcommand",
+    "end",
+    "function __fish_is_first_arg",
+    "    set -l words (commandline -opc)",
+    "    test (count \$words) -le 1",
+    "end",
+    "function __fish_complete_directories",
+    "    set -l tok (commandline -ct)",
+    "    for d in \$tok*/",
+    "        printf '%s\\tdirectory\\n' \$d",
+    "    end",
+    "end"
+], "\n")
+fn load_fish_completion(cmd) {
+    if cmd in COMP_LOADED {
+        return
+    }
+    COMP_LOADED[cmd] = true
+    let p = fish_dir() + "/completions/" + cmd + ".fish"
+    let t = os.read_file(p)
+    if t != null {
+        run_source(t, p)
+    }
+}
+
+// the -a word list: words expand (so (cmd) runs); "text\tdesc" lines split
+fn rule_args(text, desc) {
+    var out = []
+    let lx = lex(text)
+    for t in lx.toks {
+        if t.t != "w" {
+            continue
+        }
+        let quiet_saved = QUIET_ERRS
+        QUIET_ERRS = 1
+        let vals = expand_word(t.v, true)
+        QUIET_ERRS = quiet_saved
+        for v in vals {
+            for line in v.split("\n") {
+                if line == "" {
+                    continue
+                }
+                let tab = line.index_of("\t")
+                if tab >= 0 {
+                    out.push({text: line[:tab], kind: "arg", desc: line[tab + 1:]})
+                } else {
+                    out.push({text: line, kind: "arg", desc: desc})
+                }
+            }
+        }
+    }
+    return out
+}
+
+fn quiet_status(src) {
+    OUTBUF.push("")
+    QUIET_ERRS += 1
+    let r = parse_program(src)
+    let st = r.status == "ok" ? run_node(r.node) : 1
+    QUIET_ERRS -= 1
+    OUTBUF.pop()
+    return st
+}
+
+// bash -F: COMP_WORDS / COMP_CWORD in, COMPREPLY out
+fn run_comp_func(rule, words, word) {
+    if not (rule.func in FUNCS) {
+        return []
+    }
+    let all = words + [word]
+    var_set("COMP_WORDS", all, "global")
+    var_set("COMP_CWORD", [str(len(all) - 1)], "global")
+    var_erase("COMPREPLY")
+    OUTBUF.push("")
+    call_function(FUNCS[rule.func], [rule.func, all[0], word, len(all) > 1 ? all[-2] : ""])
+    OUTBUF.pop()
+    return [{text: x, kind: "arg", desc: ""} for x in (var_lookup("COMPREPLY") ?? [])]
+}
+
+// options from `cmd --help`: lines like "  -a, --all   do not ignore entries"
+fn help_options(cmd) {
+    if cmd in HELP_CACHE {
+        return HELP_CACHE[cmd]
+    }
+    var out = []
+    let path = os.which(cmd)
+    if path != null and os.is_binary(path) and not (cmd in ["reboot", "shutdown", "halt", "poweroff", "kill", "killall", "su", "sudo"]) {
+        let r = os.run([[path, "--help"]], {capture: true, stderr_to_stdout: true, input: "", timeout_ms: 1000})
+        for line in r.output.split("\n") {
+            let t = line.trim()
+            if not t.starts_with("-") or len(line) - len(line.trim()) > 30 {
+                continue
+            }
+            // split "options   description" at the first run of 2+ spaces
+            var k = t.index_of("  ")
+            let opts = k > 0 ? t[:k] : t
+            let desc = k > 0 ? t[k:].trim() : ""
+            for part in opts.replace(",", " ").split(" ") {
+                var o = part
+                let eq = o.index_of("=")
+                if eq > 0 {
+                    o = o[:eq]
+                }
+                let br = o.index_of("[")
+                if br > 0 {
+                    o = o[:br]
+                }
+                if o.starts_with("-") and len(o) > 1 and not o.ends_with("-") and o[1] != " " {
+                    out.push({text: o, kind: "option", desc: len(desc) > 50 ? desc[:49] + "…" : desc})
+                }
+            }
+        }
+    }
+    HELP_CACHE[cmd] = out
+    return out
+}
+
+// rule/option candidates for an argument of `cmd`; null = no opinion
+fn rule_candidates(cmd, words, word, line, cursor) {
+    load_fish_completion(cmd)
+    let rules = [r for r in RULES if r.cmd == cmd]
+    CMDLINE = {buf: line, cur: cursor}
+    var out = []
+    var nofiles = false
+    for r in rules {
+        if r.cond != null and quiet_status(r.cond) != 0 {
+            continue
+        }
+        if r.func != null {
+            out = out + run_comp_func(r, words, word)
+            nofiles = true
+            continue
+        }
+        if r.nofiles {
+            nofiles = true
+        }
+        let is_opt = r.short != null or r.long != null or r.old != null
+        if is_opt and word.starts_with("-") {
+            if r.short != null {
+                out.push({text: "-" + r.short, kind: "option", desc: r.desc})
+            }
+            if r.long != null {
+                out.push({text: "--" + r.long, kind: "option", desc: r.desc})
+            }
+            if r.old != null {
+                out.push({text: "-" + r.old, kind: "option", desc: r.desc})
+            }
+        }
+        if r.args != null and not is_opt and not word.starts_with("-") {
+            out = out + rule_args(r.args, r.desc)
+        }
+    }
+    if word.starts_with("-") and len([c for c in out if c.kind == "option"]) == 0 {
+        let base = cmd == "ll" or cmd == "la" ? "ls" : cmd
+        out = out + help_options(base)
+        nofiles = true
+    }
+    if len(rules) == 0 and not word.starts_with("-") {
+        return null
+    }
+    return {cands: [c for c in out if c.text.starts_with(word)], nofiles: nofiles}
+}

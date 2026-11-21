@@ -1,0 +1,25 @@
+11 1024 3 -1 10 31 1
+after=6
+not-big
+loop 0
+loop 1
+loop 2
+short=0
+glob-ok
+re txt
+files-ok
+group-ok
+order-ok
+test-ok
+z-ok
+usr/local/lib/archive.tar.gz archive.tar.gz /usr/local/lib/archive.tar /usr/local/lib/archive
+/usr/local/LIB/archive.tar.gz /usr/locAl/lib/Archive.tAr.gz U/local/lib/archive.tar.gz /usr/local/lib/archive.tar.xz
+World Hello rld HELLOWORLD helloworld
+HelloWorld 10
+heredoc 6 sub 2
+  "quotes" stay
+after-heredoc
+in-sub /
+out-unchanged
+cap=/usr
+end

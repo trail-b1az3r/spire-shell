@@ -1,0 +1,33 @@
+hello world
+2 3 3
+item a
+item b
+item c
+bash 1
+bash 2
+yes
+elif-ok
+hi bob
+args: 2 one
+A B C
+nested fish-subst
+/etc/hostname
+x1 x2 y1 y2 1 2 3
+fish-or
+fish-and
+not-ok
+switched
+bash-case
+n=3
+none default 0
+SHOUT
+alias works
+got piped
+ONE TWO
+st=127
+/tmp
+*.nonexistent-glob
+9
+command-q
+from-pipe
+2

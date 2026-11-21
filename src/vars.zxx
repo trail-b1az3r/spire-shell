@@ -1,0 +1,114 @@
+// vars.zxx - variables. Like fish, every variable is a list of strings;
+// a plain value is a list of one. Function calls get a local scope.
+
+var GLOBALS = {}
+var EXPORTED = {}
+var SCOPES = []          // innermost last; each a map name -> list
+var STATUS = 0
+var PIPESTATUS = [0]
+
+fn var_lookup(name) {
+    var i = len(SCOPES) - 1
+    while i >= 0 {
+        if name in SCOPES[i] {
+            return SCOPES[i][name]
+        }
+        i -= 1
+    }
+    if name == "status" or name == "?" {
+        return [str(STATUS)]
+    }
+    if name == "pipestatus" or name == "PIPESTATUS" {
+        return [str(s) for s in PIPESTATUS]
+    }
+    if name == "PWD" {
+        return [os.cwd()]
+    }
+    if name == "RANDOM" {
+        return [str(random(0, 32767))]
+    }
+    if name in GLOBALS {
+        return GLOBALS[name]
+    }
+    return null
+}
+
+fn var_get1(name) {
+    let v = var_lookup(name)
+    if v == null or len(v) == 0 {
+        return ""
+    }
+    return join(v, " ")
+}
+
+fn env_text(name, vals) {
+    // PATH-like lists are exported joined with ':'
+    return join(vals, name.ends_with("PATH") ? ":" : " ")
+}
+
+fn var_set(name, vals, scope = "auto") {
+    if scope == "local" and len(SCOPES) > 0 {
+        SCOPES[-1][name] = vals
+        return
+    }
+    if scope == "auto" {
+        var i = len(SCOPES) - 1
+        while i >= 0 {
+            if name in SCOPES[i] {
+                SCOPES[i][name] = vals
+                return
+            }
+            i -= 1
+        }
+    }
+    GLOBALS[name] = vals
+    if name in EXPORTED {
+        os.setenv(name, env_text(name, vals))
+    }
+    on_var_set(name)
+}
+
+fn var_export(name) {
+    EXPORTED[name] = true
+    let v = var_lookup(name)
+    os.setenv(name, env_text(name, v ?? []))
+}
+
+fn var_erase(name) {
+    var i = len(SCOPES) - 1
+    while i >= 0 {
+        if name in SCOPES[i] {
+            remove(SCOPES[i], name)
+            return true
+        }
+        i -= 1
+    }
+    if name in GLOBALS {
+        remove(GLOBALS, name)
+        if name in EXPORTED {
+            remove(EXPORTED, name)
+            os.unsetenv(name)
+        }
+        return true
+    }
+    return false
+}
+
+fn vars_import_env() {
+    for (k, v) in items(os.environ()) {
+        GLOBALS[k] = [v]
+        EXPORTED[k] = true
+    }
+}
+
+// position of the last `sub` in `s`, or -1
+fn last_index(s, sub) {
+    var i = len(s) - len(sub)
+    while i >= 0 {
+        if s[i:i + len(sub)] == sub {
+            return i
+        }
+        i -= 1
+    }
+    return -1
+}

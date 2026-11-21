@@ -1,0 +1,686 @@
+// parse.zxx - one recursive-descent parser for both syntaxes:
+//   if/else if/else/end   and   if/then/elif/else/fi
+//   while ... end         and   while ...; do ... done   (also until)
+//   for x in ...; ... end and   for x in ...; do ... done
+//   function f ... end    and   f() { ... }
+//   switch x; case a; ... end   and   case x in a|b) ... ;; esac
+//   begin ... end, { ... }, cmd; and cmd, cmd; or cmd, not cmd, ! cmd
+//
+// Nodes are maps with a kind `k`: cmd, pipe, and, or, seq, if, while, for,
+// func, switch, fand, for_, not.
+
+var P = {toks: [], pos: 0, err: null, incomplete: false}
+
+fn tok() {
+    if P.pos < len(P.toks) {
+        return P.toks[P.pos]
+    }
+    return {t: "eof", v: ""}
+}
+
+fn advance() {
+    P.pos += 1
+}
+
+fn is_w(v) {
+    let t = tok()
+    return t.t == "w" and t.v == v
+}
+
+fn is_op(v) {
+    let t = tok()
+    return t.t == "op" and t.v == v
+}
+
+fn fail(msg) {
+    if P.err == null {
+        P.err = msg
+    }
+    return null
+}
+
+fn skip_seps() {
+    while is_op("\n") or is_op(";") {
+        advance()
+    }
+}
+
+fn skip_nl() {
+    while is_op("\n") {
+        advance()
+    }
+}
+
+fn expect_w(v) {
+    if tok().t == "eof" {
+        P.incomplete = true
+        return false
+    }
+    if not is_w(v) {
+        fail("expected '${v}' but found '${tok().v}'")
+        return false
+    }
+    advance()
+    return true
+}
+
+// statements until one of `stops` (a word) starts a statement
+fn parse_list(stops) {
+    var body = []
+    loop {
+        skip_seps()
+        let t = tok()
+        if t.t == "eof" {
+            if len(stops) > 0 {
+                P.incomplete = true
+            }
+            break
+        }
+        if t.t == "w" and t.v in stops {
+            break
+        }
+        let st = parse_and_or()
+        if st == null {
+            return null
+        }
+        if is_op("&") {
+            st.bg = true
+            advance()
+        }
+        body.push(st)
+        if P.err != null or P.incomplete {
+            return null
+        }
+        let after = tok()
+        if after.t == "op" and after.v != "\n" and after.v != ";" and after.v != "&" {
+            return fail("unexpected '${after.v}'")
+        }
+    }
+    return {k: "seq", body: body}
+}
+
+fn parse_and_or() {
+    var left = parse_pipeline()
+    while left != null and (is_op("&&") or is_op("||")) {
+        let kind = tok().v == "&&" ? "and" : "or"
+        advance()
+        skip_nl()
+        let right = parse_pipeline()
+        if right == null {
+            return null
+        }
+        left = {k: kind, l: left, r: right}
+    }
+    return left
+}
+
+fn parse_pipeline() {
+    var neg = false
+    while is_w("!") or is_w("not") {
+        neg = not neg
+        advance()
+    }
+    if is_w("time") {
+        advance()
+    }
+    let first = parse_command()
+    if first == null {
+        return null
+    }
+    var node = first
+    if is_op("|") or is_op("|&") {
+        var stages = [first]
+        while is_op("|") or is_op("|&") {
+            if tok().v == "|&" {
+                stages[-1].err_to_pipe = true
+            }
+            advance()
+            skip_nl()
+            let next = parse_command()
+            if next == null {
+                return null
+            }
+            stages.push(next)
+        }
+        node = {k: "pipe", stages: stages}
+    }
+    if neg {
+        return {k: "not", x: node}
+    }
+    return node
+}
+
+fn parse_block_until(stops) {
+    return parse_list(stops)
+}
+
+fn parse_command() {
+    let t = tok()
+    if t.t == "eof" {
+        P.incomplete = true
+        return null
+    }
+    if t.t == "op" and not is_redir_op(t.v) {
+        return fail("unexpected '${t.v}'")
+    }
+    let w = t.v
+    if t.t == "w" {
+        if (w == "and" or w == "or") and P.pos + 1 < len(P.toks) and P.toks[P.pos + 1].t == "w" {
+            advance()
+            let inner = parse_pipeline()
+            if inner == null {
+                return null
+            }
+            return {k: w == "and" ? "fand" : "fish_or", x: inner}
+        }
+        if w == "if" {
+            return parse_if()
+        }
+        if w == "while" or w == "until" {
+            return parse_while(w == "until")
+        }
+        if w == "for" {
+            return parse_for()
+        }
+        if w == "select" {
+            let f = parse_for()
+            if f != null {
+                f.k = "select"
+            }
+            return f
+        }
+        if w == "function" {
+            return parse_function()
+        }
+        if w == "switch" {
+            return parse_switch()
+        }
+        if w == "case" {
+            return parse_case()
+        }
+        if w == "begin" or w == "{" {
+            advance()
+            let closer = w == "begin" ? "end" : "}"
+            let body = parse_list([closer])
+            if body == null or not expect_w(closer) {
+                return null
+            }
+            return with_redirs(body)
+        }
+        if w.ends_with("()") and len(w) > 2 {
+            return parse_paren_function(w[:-2])
+        }
+        if w == "[[" {
+            return parse_cond()
+        }
+        if w.starts_with("((") and w.ends_with("))") and len(w) >= 4 {
+            advance()
+            return with_redirs({k: "arith", expr: w[2:-2]})
+        }
+        if w.starts_with("(") and w.ends_with(")") {
+            // ( commands ): a subshell
+            advance()
+            let inner = parse_program_nested(w[1:-1])
+            if inner == null {
+                return null
+            }
+            return with_redirs({k: "subshell", body: inner})
+        }
+    }
+    return parse_simple()
+}
+
+fn is_redir_op(v) {
+    return v in [">", ">>", "<", "2>", "2>>", "&>", "&>>", "<<<", "<<", "<<-", "2>&1", ">&2"]
+}
+
+fn parse_redir() {
+    let ot = tok()
+    let op = ot.v
+    advance()
+    if op == "<<" or op == "<<-" {
+        if tok().t != "w" {
+            return fail("expected a delimiter after '${op}'")
+        }
+        advance()
+        return {op: "<<", target: "", body: ot.body ?? "", quoted: ot.quoted ?? false}
+    }
+    if op == "2>&1" or op == ">&2" {
+        return {op: op, target: ""}
+    }
+    if tok().t != "w" {
+        return fail("expected a file after '${op}'")
+    }
+    let target = tok().v
+    advance()
+    return {op: op, target: target}
+}
+
+// trailing redirections on a block: `while ...; end > file`
+fn with_redirs(node) {
+    var rs = []
+    while tok().t == "op" and is_redir_op(tok().v) {
+        let r = parse_redir()
+        if r == null {
+            return null
+        }
+        rs.push(r)
+    }
+    if len(rs) > 0 {
+        node.redirs = rs
+    }
+    return node
+}
+
+fn is_assignment(w) {
+    let eq = w.index_of("=")
+    if eq < 1 {
+        return false
+    }
+    var name = w[:eq]
+    if name.ends_with("+") {
+        name = name[:-1]
+    }
+    let br = name.index_of("[")
+    if br > 0 and name.ends_with("]") {
+        name = name[:br]
+    }
+    for c in name.chars() {
+        if not (c == "_" or ("a" <= c.lower() and c.lower() <= "z") or ("0" <= c and c <= "9")) {
+            return false
+        }
+    }
+    return not ("0" <= name[0] and name[0] <= "9")
+}
+
+fn parse_simple() {
+    var words = []
+    var assigns = []
+    var redirs = []
+    loop {
+        let t = tok()
+        if t.t == "w" {
+            if len(words) == 0 and is_assignment(t.v) {
+                assigns.push(t.v)
+            } else {
+                words.push(t.v)
+            }
+            advance()
+        } elif t.t == "op" and is_redir_op(t.v) {
+            let r = parse_redir()
+            if r == null {
+                return null
+            }
+            redirs.push(r)
+        } else {
+            break
+        }
+    }
+    if len(words) == 0 and len(assigns) == 0 and len(redirs) == 0 {
+        return fail("expected a command")
+    }
+    return {k: "cmd", words: words, assigns: assigns, redirs: redirs}
+}
+
+fn parse_if() {
+    advance() // if
+    let cond = parse_and_or()
+    if cond == null {
+        return null
+    }
+    skip_seps()
+    var bash = false
+    if is_w("then") {
+        advance()
+        bash = true
+    }
+    let stops = bash ? ["elif", "else", "fi"] : ["else", "end"]
+    let body = parse_list(stops)
+    if body == null {
+        return null
+    }
+    var node = {k: "if", cond: cond, body: body, other: null}
+    if bash and is_w("elif") {
+        // elif ... : rewrite as `else if ... fi`
+        P.toks[P.pos] = {t: "w", v: "if"}
+        node.other = {k: "seq", body: [parse_if_tail_bash()]}
+        return node.other.body[0] == null ? null : node
+    }
+    if is_w("else") {
+        advance()
+        if not bash and is_w("if") {
+            let nested = parse_if()
+            if nested == null {
+                return null
+            }
+            node.other = {k: "seq", body: [nested]}
+            return node // the nested if consumed the shared `end`
+        }
+        let other = parse_list([bash ? "fi" : "end"])
+        if other == null {
+            return null
+        }
+        node.other = other
+    }
+    if not expect_w(bash ? "fi" : "end") {
+        return null
+    }
+    return with_redirs(node)
+}
+
+// `elif` chains share the outer `fi`
+fn parse_if_tail_bash() {
+    advance() // the `if` we put in place of elif
+    let cond = parse_and_or()
+    if cond == null {
+        return null
+    }
+    skip_seps()
+    if not expect_w("then") {
+        return null
+    }
+    let body = parse_list(["elif", "else", "fi"])
+    if body == null {
+        return null
+    }
+    var node = {k: "if", cond: cond, body: body, other: null}
+    if is_w("elif") {
+        P.toks[P.pos] = {t: "w", v: "if"}
+        let nested = parse_if_tail_bash()
+        if nested == null {
+            return null
+        }
+        node.other = {k: "seq", body: [nested]}
+        return node
+    }
+    if is_w("else") {
+        advance()
+        let other = parse_list(["fi"])
+        if other == null {
+            return null
+        }
+        node.other = other
+    }
+    if not expect_w("fi") {
+        return null
+    }
+    return node
+}
+
+fn parse_while(until) {
+    advance()
+    let cond = parse_and_or()
+    if cond == null {
+        return null
+    }
+    skip_seps()
+    var bash = false
+    if is_w("do") {
+        advance()
+        bash = true
+    }
+    let closer = bash ? "done" : "end"
+    let body = parse_list([closer])
+    if body == null or not expect_w(closer) {
+        return null
+    }
+    return with_redirs({k: "while", cond: cond, body: body, until: until})
+}
+
+fn parse_for() {
+    advance()
+    if tok().t != "w" {
+        return fail("expected a variable name after 'for'")
+    }
+    let name = tok().v
+    advance()
+    var items = []
+    if is_w("in") {
+        advance()
+        while tok().t == "w" {
+            items.push(tok().v)
+            advance()
+        }
+    } else {
+        items.push("\"\$@\"")
+    }
+    skip_seps()
+    var bash = false
+    if is_w("do") {
+        advance()
+        bash = true
+    }
+    let closer = bash ? "done" : "end"
+    let body = parse_list([closer])
+    if body == null or not expect_w(closer) {
+        return null
+    }
+    return with_redirs({k: "loop_for", name: name, items: items, body: body})
+}
+
+fn parse_function() {
+    advance()
+    if tok().t != "w" {
+        return fail("expected a function name")
+    }
+    var name = tok().v
+    if name.ends_with("()") {
+        name = name[:-2]
+    }
+    advance()
+    var args = []
+    var desc = ""
+    var events = []
+    while tok().t == "w" and tok().v != "{" {
+        let o = tok().v
+        advance()
+        if o == "-a" or o == "--argument-names" {
+            while tok().t == "w" and not tok().v.starts_with("-") {
+                args.push(tok().v)
+                advance()
+            }
+        } elif o == "-d" or o == "--description" or o == "-w" or o == "--wraps" or o == "-e" or o == "--on-event" or o == "-v" or o == "--on-variable" {
+            if tok().t == "w" {
+                if o == "-d" or o == "--description" {
+                    desc = unquote_simple(tok().v)
+                } elif o == "-e" or o == "--on-event" {
+                    events.push("event:" + tok().v)
+                } elif o == "-v" or o == "--on-variable" {
+                    events.push("var:" + tok().v)
+                }
+                advance()
+            }
+        }
+    }
+    skip_seps()
+    var closer = "end"
+    if is_w("{") {
+        advance()
+        closer = "}"
+    }
+    let body = parse_list([closer])
+    if body == null or not expect_w(closer) {
+        return null
+    }
+    return {k: "func", name: name, body: body, args: args, desc: desc, events: events}
+}
+
+fn parse_paren_function(name) {
+    advance()
+    skip_seps()
+    if not expect_w("{") {
+        return null
+    }
+    let body = parse_list(["}"])
+    if body == null or not expect_w("}") {
+        return null
+    }
+    return {k: "func", name: name, body: body, args: [], desc: "", events: []}
+}
+
+fn unquote_simple(w) {
+    if len(w) >= 2 and (w[0] == "'" or w[0] == "\"") and w[-1] == w[0] {
+        return w[1:-1]
+    }
+    return w
+}
+
+// fish: switch WORD; case PAT...; ...; end
+fn parse_switch() {
+    advance()
+    if tok().t != "w" {
+        return fail("expected a value after 'switch'")
+    }
+    let subject = tok().v
+    advance()
+    skip_seps()
+    var arms = []
+    while not is_w("end") {
+        if tok().t == "eof" {
+            P.incomplete = true
+            return null
+        }
+        if not expect_w("case") {
+            return null
+        }
+        var pats = []
+        while tok().t == "w" {
+            pats.push(tok().v)
+            advance()
+        }
+        let body = parse_list(["case", "end"])
+        if body == null {
+            return null
+        }
+        arms.push({pats: pats, body: body})
+    }
+    advance()
+    return with_redirs({k: "switch", subject: subject, arms: arms})
+}
+
+// bash: case WORD in a|b) ... ;; esac
+fn parse_case() {
+    advance()
+    if tok().t != "w" {
+        return fail("expected a value after 'case'")
+    }
+    let subject = tok().v
+    advance()
+    skip_seps()
+    if not expect_w("in") {
+        return null
+    }
+    var arms = []
+    loop {
+        skip_seps()
+        if is_w("esac") {
+            advance()
+            break
+        }
+        if tok().t == "eof" {
+            P.incomplete = true
+            return null
+        }
+        var pats = []
+        loop {
+            if tok().t != "w" {
+                return fail("expected a case pattern")
+            }
+            var p = tok().v
+            if p.starts_with("(") {
+                p = p[1:]
+            }
+            pats.push(p)
+            advance()
+            if is_op("|") {
+                advance()
+                continue
+            }
+            break
+        }
+        if not is_op(")") {
+            return fail("expected ')' after a case pattern")
+        }
+        advance()
+        var body = []
+        loop {
+            skip_nl()
+            if tok().t == "eof" {
+                P.incomplete = true
+                return null
+            }
+            if is_w("esac") {
+                break
+            }
+            if is_op(";") {
+                advance()
+                if is_op(";") {
+                    advance()
+                    break
+                }
+                continue
+            }
+            let st = parse_and_or()
+            if st == null {
+                return null
+            }
+            body.push(st)
+        }
+        arms.push({pats: pats, body: {k: "seq", body: body}})
+    }
+    return with_redirs({k: "switch", subject: subject, arms: arms})
+}
+
+// [[ expression ]]: its words, with && || ! < > kept as words
+fn parse_cond() {
+    advance() // [[
+    var words = []
+    loop {
+        let t = tok()
+        if t.t == "eof" {
+            P.incomplete = true
+            return null
+        }
+        if t.t == "w" and t.v == "]]" {
+            advance()
+            break
+        }
+        if t.t == "op" and not (t.v in ["&&", "||", "<", ">"]) {
+            return fail("unexpected '${t.v}' in [[ ]]")
+        }
+        words.push(t.v)
+        advance()
+    }
+    return with_redirs({k: "cond", words: words})
+}
+
+// parses text inside ( ... ) with its own parser state
+fn parse_program_nested(src) {
+    let saved = P
+    let r = parse_program(src)
+    P = saved
+    if r.status == "ok" {
+        return r.node
+    }
+    if r.status == "empty" {
+        return {k: "seq", body: []}
+    }
+    return fail(r.err ?? "unfinished ( ... )")
+}
+
+// -> {status: "ok" | "incomplete" | "error" | "empty", node, err}
+fn parse_program(src) {
+    let lx = lex(src)
+    P = {toks: lx.toks, pos: 0, err: null, incomplete: false}
+    if len(lx.toks) == 0 {
+        return {status: lx.open ? "incomplete" : "empty", node: null, err: null}
+    }
+    let node = parse_list([])
+    if lx.open or P.incomplete {
+        return {status: "incomplete", node: null, err: null}
+    }
+    if P.err != null or node == null {
+        return {status: "error", node: null, err: P.err ?? "syntax error"}
+    }
+    return {status: "ok", node: node, err: null}
+}

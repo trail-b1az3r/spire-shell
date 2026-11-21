@@ -1,0 +1,17 @@
+caught USR1
+after-signal
+err-trap
+name  | 3.14|007|ff|'a b'
+a-b-c-
+00042
+tab	here
+hw
+65
+opt a 
+opt b val
+opt c 
+inner
+rest: two three
+outer
+end
+bye from EXIT

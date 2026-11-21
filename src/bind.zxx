@@ -1,0 +1,272 @@
+// bind.zxx - fish key bindings for the line editor.
+//
+// A binding maps a key (as os.read_key returns it: "\x06", "\e[A") to
+// actions: fish input functions, which become the keys that do the same
+// here, or shell commands, which run with the line still being edited so
+// `commandline` can read and change it.
+
+var BINDS = {}          // key -> {spec, actions}
+var KEYQ = []           // keys produced by input functions (not re-bound)
+var EDIT = null         // the editor state while a line is being read
+
+const INPUT_FUNCTIONS = {
+    "forward-char": ["\x06"], "forward-single-char": ["\x06"], "backward-char": ["\x02"],
+    "beginning-of-line": ["\x01"], "end-of-line": ["\x05"], "beginning-of-buffer": ["\x01"], "end-of-buffer": ["\x05"],
+    "forward-word": ["\ef"], "backward-word": ["\eb"], "forward-bigword": ["\ef"], "backward-bigword": ["\eb"],
+    "kill-line": ["\x0b"], "backward-kill-line": ["\x15"], "kill-whole-line": ["\x01", "\x0b"],
+    "backward-kill-word": ["\x17"], "backward-kill-bigword": ["\x17"], "backward-kill-path-component": ["\x17"],
+    "delete-char": ["\e[3~"], "backward-delete-char": ["\x7f"], "delete-or-exit": ["\x04"], "exit": ["\x04"],
+    "history-search-backward": ["\e[A"], "history-search-forward": ["\e[B"], "up-or-search": ["\e[A"],
+    "down-or-search": ["\e[B"], "up-line": ["\e[A"], "down-line": ["\e[B"],
+    "history-prefix-search-backward": ["\e[A"], "history-prefix-search-forward": ["\e[B"], "history-pager": ["\x12"],
+    "complete": ["\t"], "complete-and-search": ["\e[Z"], "accept-autosuggestion": ["\x05"],
+    "execute": ["\r"], "accept": ["\r"], "clear-screen": ["\x0c"], "cancel-commandline": ["\x03"],
+    "repaint": [], "force-repaint": [], "repaint-mode": [], "suppress-autosuggestion": [], "cancel": []
+}
+
+const NAMED_KEYS = {
+    "up": ["\e[A", "\eOA"], "down": ["\e[B", "\eOB"], "right": ["\e[C", "\eOC"], "left": ["\e[D", "\eOD"],
+    "home": ["\e[H", "\eOH"], "end": ["\e[F", "\eOF"], "tab": ["\t"], "shift-tab": ["\e[Z"], "btab": ["\e[Z"],
+    "enter": ["\r"], "return": ["\r"], "backspace": ["\x7f"], "delete": ["\e[3~"], "dc": ["\e[3~"],
+    "escape": ["\e"], "space": [" "], "pageup": ["\e[5~"], "pagedown": ["\e[6~"], "npage": ["\e[6~"], "ppage": ["\e[5~"],
+    "f1": ["\eOP"], "f2": ["\eOQ"], "f3": ["\eOR"], "f4": ["\eOS"], "f5": ["\e[15~"], "f6": ["\e[17~"],
+    "f7": ["\e[18~"], "f8": ["\e[19~"], "f9": ["\e[20~"], "f10": ["\e[21~"], "f11": ["\e[23~"], "f12": ["\e[24~"],
+    "ctrl-up": ["\e[1;5A"], "ctrl-down": ["\e[1;5B"], "ctrl-right": ["\e[1;5C"], "ctrl-left": ["\e[1;5D"],
+    "alt-up": ["\e[1;3A"], "alt-down": ["\e[1;3B"], "alt-right": ["\e[1;3C"], "alt-left": ["\e[1;3D"]
+}
+
+fn ctrl_char(c) {
+    let o = os.ord(c.lower())
+    return os.chr(o % 32)
+}
+
+// fish key notation -> the key strings os.read_key returns
+fn key_seqs(spec, terminfo) {
+    var key = spec
+    if terminfo and key.starts_with("key_") {
+        key = key[4:]
+    }
+    if key.lower() in NAMED_KEYS {
+        return NAMED_KEYS[key.lower()]
+    }
+    if terminfo {
+        return []
+    }
+    var rest = spec
+    var ctrl = false
+    var alt = false
+    loop {
+        if rest.lower().starts_with("ctrl-") and len(rest) > 5 {
+            ctrl = true
+            rest = rest[5:]
+        } elif rest.lower().starts_with("alt-") and len(rest) > 4 {
+            alt = true
+            rest = rest[4:]
+        } else {
+            break
+        }
+    }
+    if ctrl or alt {
+        var k = len(rest) > 1 and rest.lower() in NAMED_KEYS ? NAMED_KEYS[rest.lower()][0] : (ctrl ? ctrl_char(rest[0]) : rest[0])
+        return [(alt ? "\e" : "") + k]
+    }
+    // old style: \cX \e \n \r \t \b \xHH and plain characters
+    var out = ""
+    let cs = spec.chars()
+    var i = 0
+    while i < len(cs) {
+        let c = cs[i]
+        if c != "\\" or i + 1 >= len(cs) {
+            out = out + c
+            i += 1
+            continue
+        }
+        let e = cs[i + 1]
+        i += 2
+        if (e == "c" or e == "C") and i < len(cs) {
+            out = out + ctrl_char(cs[i])
+            i += 1
+        } elif e == "e" {
+            out = out + "\e"
+        } elif e == "n" {
+            out = out + "\n"
+        } elif e == "r" {
+            out = out + "\r"
+        } elif e == "t" {
+            out = out + "\t"
+        } elif e == "b" {
+            out = out + "\x08"
+        } elif e == "x" {
+            var h = ""
+            while i < len(cs) and len(h) < 2 and cs[i] in "0123456789abcdefABCDEF" {
+                h = h + cs[i]
+                i += 1
+            }
+            out = out + os.chr(hex_val(h))
+        } else {
+            out = out + e
+        }
+    }
+    return out == "" ? [] : [out]
+}
+
+fn builtin_bind(argv) {
+    var erase = false
+    var terminfo = false
+    var mode = "default"
+    var i = 1
+    while i < len(argv) and argv[i].starts_with("-") and len(argv[i]) > 1 {
+        let a = argv[i]
+        if a == "--" {
+            i += 1
+            break
+        }
+        if (a == "-M" or a == "--mode" or a == "-m" or a == "--sets-mode") and i + 1 < len(argv) {
+            if a == "-M" or a == "--mode" {
+                mode = argv[i + 1]
+            }
+            i += 2
+            continue
+        }
+        if a == "-e" or a == "--erase" {
+            erase = true
+        } elif a == "-k" or a == "--key" {
+            terminfo = true
+        } elif a == "-f" or a == "--function-names" {
+            for n in keys(INPUT_FUNCTIONS) {
+                outl(n)
+            }
+            return 0
+        } elif a == "-L" or a == "--list-modes" {
+            outl("default")
+            outl("insert")
+            return 0
+        }
+        i += 1
+    }
+    if i >= len(argv) {
+        var seen = {}
+        for b in values(BINDS) {
+            let line = b.spec + " " + join([shell_quote(a) for a in b.actions], " ")
+            if not (line in seen) {
+                seen[line] = true
+                outl("bind " + line)
+            }
+        }
+        return 0
+    }
+    let spec = argv[i]
+    let seqs = key_seqs(spec, terminfo)
+    if len(seqs) == 0 {
+        err("bind: ${spec}: unknown key")
+        return 1
+    }
+    if erase {
+        for k in seqs {
+            if k in BINDS {
+                remove(BINDS, k)
+            }
+        }
+        return 0
+    }
+    if i + 1 >= len(argv) or not (mode == "default" or mode == "insert") {
+        return 0
+    }
+    for k in seqs {
+        BINDS[k] = {spec: spec, actions: argv[i + 1:]}
+    }
+    return 0
+}
+
+// runs a bound command; its output appears above the line, which repaints
+fn run_bound_command(st, cmd) {
+    raw_mode(false)
+    OUTBUF.push("")
+    run_source(cmd)
+    let text = OUTBUF.pop()
+    raw_mode(true)
+    if st.cur > len(st.buf) {
+        st.cur = len(st.buf)
+    }
+    if text != "" {
+        let cur = st.cur
+        st.cur = len(st.buf)
+        redraw(st, true)
+        st.cur = cur
+        os.write("\r\n" + text.replace("\n", "\r\n") + (text.ends_with("\n") ? "" : "\r\n"))
+        st.row = 0
+    }
+    redraw(st)
+}
+
+// -> true if `k` was a bound key (its actions are done or queued)
+fn dispatch_binding(st, k) {
+    if not (k in BINDS) {
+        return false
+    }
+    for a in BINDS[k].actions {
+        if a in INPUT_FUNCTIONS {
+            for x in INPUT_FUNCTIONS[a] {
+                KEYQ.push(x)
+            }
+            if len(INPUT_FUNCTIONS[a]) == 0 {
+                redraw(st)
+            }
+        } else {
+            run_bound_command(st, a)
+        }
+    }
+    return true
+}
+
+// the next key: queued ones (from input functions) first, unbound
+fn next_key(st) {
+    if len(KEYQ) > 0 {
+        return KEYQ.remove(0)
+    }
+    loop {
+        let k = os.read_key()
+        if k == "" or not dispatch_binding(st, k) {
+            return k
+        }
+        if len(KEYQ) > 0 {
+            return KEYQ.remove(0)
+        }
+    }
+}
+
+// ---- commandline edits ----
+
+fn token_bounds(st) {
+    var a = st.cur
+    var b = st.cur
+    while a > 0 and not (st.buf[a - 1] in [" ", ";", "|", "&"]) {
+        a -= 1
+    }
+    while b < len(st.buf) and not (st.buf[b] in [" ", ";", "|", "&"]) {
+        b += 1
+    }
+    return [a, b]
+}
+
+fn commandline_edit(mode, text) {
+    let st = EDIT
+    if st == null {
+        err("commandline: not editing a command line")
+        return 1
+    }
+    if mode == "insert" {
+        st.buf = st.buf[:st.cur] + text + st.buf[st.cur:]
+        st.cur += len(text)
+    } elif mode == "append" {
+        st.buf = st.buf + text
+    } elif mode == "token" {
+        let tb = token_bounds(st)
+        st.buf = st.buf[:tb[0]] + text + st.buf[tb[1]:]
+        st.cur = tb[0] + len(text)
+    } else {
+        st.buf = text
+        st.cur = len(text)
+    }
+    return 0
+}

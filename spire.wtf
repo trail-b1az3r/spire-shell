@@ -1,0 +1,10 @@
+# Whetstone Translation File for spire, the shell, written in Zsharpend.
+[project]
+name = "spire"
+version = "0.1.0"
+entry = "src/main.zxx"
+host = "standalone"
+description = "spire: a fish/bash-flavored interactive shell, written in Zsharpend"
+
+[extenders]
+use = ["os"]

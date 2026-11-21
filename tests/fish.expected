@@ -1,0 +1,7 @@
+orig x
+replaced
+bind \cg 'commandline -r hi'
+bind up history-search-backward
+bind alt-x forward-char
+2
+status=1

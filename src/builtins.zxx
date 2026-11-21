@@ -1,0 +1,1419 @@
+// builtins.zxx - commands that run inside the shell.
+
+var ABBRS = {}
+var HISTORY = []
+var LS_OPTS = null       // the color/indicator flags this system's ls accepts
+
+fn builtin_cd(argv) {
+    var target = len(argv) > 1 ? argv[1] : os.home()
+    if target == "-" {
+        target = var_get1("OLDPWD")
+        outl(target)
+    }
+    let old = os.cwd()
+    let e = os.chdir(target)
+    if e != null {
+        err("cd: ${target}: ${e}")
+        return 1
+    }
+    var_set("OLDPWD", [old], "global")
+    var_export("OLDPWD")
+    os.setenv("PWD", os.cwd())
+    emit_event("var:PWD")
+    return 0
+}
+
+fn echo_escapes(s) {
+    let pairs = [["\\n", "\n"], ["\\t", "\t"], ["\\e", "\e"], ["\\033", "\e"], ["\\x1b", "\e"], ["\\a", "\a"], ["\\r", "\r"], ["\\\\", "\\"]]
+    var r = s
+    for p in pairs {
+        r = r.replace(p[0], p[1])
+    }
+    return r
+}
+
+fn builtin_echo(argv) {
+    var nl = true
+    var esc = false
+    var i = 1
+    while i < len(argv) and argv[i] in ["-n", "-e", "-ne", "-en", "-E", "-s"] {
+        if argv[i].index_of("n") >= 0 {
+            nl = false
+        }
+        if argv[i].index_of("e") >= 0 {
+            esc = true
+        }
+        i += 1
+    }
+    var text = join(argv[i:], " ")
+    if esc {
+        text = echo_escapes(text)
+    }
+    out(text + (nl ? "\n" : ""))
+    return 0
+}
+
+fn print_vars() {
+    var names = keys(GLOBALS)
+    for n in names.sort() {
+        let v = GLOBALS[n]
+        outl(n + " " + join(["'" + x + "'" for x in v], " "))
+    }
+    return 0
+}
+
+// bash: set -e / -x / -u / -o pipefail / +e ... / set -- args
+fn bash_set(argv) {
+    var i = 1
+    while i < len(argv) {
+        let a = argv[i]
+        if a == "--" {
+            var_set("argv", argv[i + 1:])
+            return 0
+        }
+        let turn_on = a.starts_with("-")
+        if a == "-o" or a == "+o" {
+            if i + 1 >= len(argv) {
+                for (k, v) in items(OPTS) {
+                    outl(k + " " * (10 - len(k)) + (v ? "turn_on" : "off"))
+                }
+                return 0
+            }
+            let name = argv[i + 1]
+            if name in OPTS {
+                OPTS[name] = turn_on
+            }
+            i += 2
+            continue
+        }
+        for c in a[1:].chars() {
+            if c == "e" {
+                OPTS.errexit = turn_on
+            } elif c == "x" {
+                OPTS.xtrace = turn_on
+            } elif c == "u" {
+                OPTS.nounset = turn_on
+            }
+        }
+        i += 1
+    }
+    return 0
+}
+
+// is it bash's `set -e` / `set -euo pipefail` rather than fish's `set -x NAME`?
+fn is_bash_set(argv) {
+    let a = argv[1]
+    if a == "--" or a.starts_with("+") {
+        return true
+    }
+    if not a.starts_with("-") or len(a) < 2 {
+        return false
+    }
+    for c in a[1:].chars() {
+        if not (c in "euxvfo") {
+            return false
+        }
+    }
+    return a.index_of("o") >= 0 or len(argv) == 2
+}
+
+// fish's set
+fn builtin_set(argv) {
+    if len(argv) == 1 {
+        return print_vars()
+    }
+    if is_bash_set(argv) {
+        return bash_set(argv)
+    }
+    var scope = "auto"
+    var export = false
+    var erase = false
+    var query = false
+    var append = false
+    var prepend = false
+    var i = 1
+    while i < len(argv) and argv[i].starts_with("-") and len(argv[i]) > 1 {
+        let o = argv[i]
+        if o == "--" {
+            i += 1
+            break
+        }
+        for c in o[1:].chars() {
+            if c == "l" {
+                scope = "local"
+            } elif c == "g" or c == "U" {
+                scope = "global"
+            } elif c == "x" {
+                export = true
+            } elif c == "e" {
+                erase = true
+            } elif c == "q" {
+                query = true
+            } elif c == "a" {
+                append = true
+            } elif c == "p" {
+                prepend = true
+            }
+        }
+        i += 1
+    }
+    if i >= len(argv) {
+        return erase or query ? 1 : 0
+    }
+    if query {
+        var missing = 0
+        for n in argv[i:] {
+            if var_lookup(n) == null {
+                missing += 1
+            }
+        }
+        return missing
+    }
+    let name = argv[i]
+    if erase {
+        return var_erase(name) ? 0 : 1
+    }
+    var vals = argv[i + 1:]
+    if append or prepend {
+        let old = var_lookup(name) ?? []
+        vals = prepend ? vals + old : old + vals
+    }
+    // PATH-like values given as one "a:b:c" word stay a single entry
+    var_set(name, vals, scope)
+    if export {
+        var_export(name)
+    }
+    return 0
+}
+
+fn builtin_export(argv) {
+    if len(argv) == 1 {
+        for n in keys(EXPORTED).sort() {
+            outl("export ${n}=" + var_get1(n))
+        }
+        return 0
+    }
+    for a in argv[1:] {
+        let eq = a.index_of("=")
+        if eq > 0 {
+            var_set(a[:eq], [a[eq + 1:]])
+            var_export(a[:eq])
+        } else {
+            var_export(a)
+        }
+    }
+    return 0
+}
+
+fn builtin_unset(argv) {
+    for n in argv[1:] {
+        if n != "-v" and n != "-f" {
+            var_erase(n)
+            if n in FUNCS {
+                remove(FUNCS, n)
+            }
+        }
+    }
+    return 0
+}
+
+fn builtin_alias(argv) {
+    if len(argv) == 1 {
+        for (k, v) in items(ALIASES) {
+            outl("alias ${k} '${v}'")
+        }
+        return 0
+    }
+    // fish: alias NAME 'cmd ...'   bash: alias NAME='cmd ...'
+    var name = argv[1]
+    var value = len(argv) > 2 ? join(argv[2:], " ") : null
+    let eq = name.index_of("=")
+    if eq > 0 {
+        value = name[eq + 1:]
+        name = name[:eq]
+    }
+    if value == null {
+        if name in ALIASES {
+            outl("alias ${name} '" + ALIASES[name] + "'")
+            return 0
+        }
+        err("alias: ${name}: not found")
+        return 1
+    }
+    ALIASES[name] = value
+    return 0
+}
+
+fn builtin_abbr(argv) {
+    var i = 1
+    var erase = false
+    while i < len(argv) and argv[i].starts_with("-") {
+        if argv[i] == "-e" or argv[i] == "--erase" {
+            erase = true
+        }
+        if argv[i] == "-l" or argv[i] == "--list" {
+            for k in keys(ABBRS) {
+                outl(k)
+            }
+            return 0
+        }
+        if argv[i] == "-q" or argv[i] == "--query" {
+            return i + 1 < len(argv) and argv[i + 1] in ABBRS ? 0 : 1
+        }
+        i += 1
+    }
+    if i >= len(argv) {
+        for (k, v) in items(ABBRS) {
+            outl("abbr -a -- ${k} '${v}'")
+        }
+        return 0
+    }
+    if erase {
+        if argv[i] in ABBRS {
+            remove(ABBRS, argv[i])
+        }
+        return 0
+    }
+    ABBRS[argv[i]] = join(argv[i + 1:], " ")
+    return 0
+}
+
+fn builtin_source(argv) {
+    if len(argv) < 2 or argv[1] == "-" {
+        // `cmd | source`
+        return run_source(stdin_text() ?? "")
+    }
+    let text = os.read_file(argv[1])
+    if text == null {
+        err("source: ${argv[1]}: can't read")
+        return 1
+    }
+    let saved = var_lookup("argv")
+    var_set("argv", argv[2:])
+    let st = run_source(text, argv[1])
+    var_set("argv", saved ?? [])
+    return st
+}
+
+fn builtin_read(argv) {
+    var names = []
+    var prompt = ""
+    var scope = "auto"
+    var i = 1
+    while i < len(argv) {
+        let a = argv[i]
+        if (a == "-p" or a == "-P" or a == "--prompt-str") and i + 1 < len(argv) {
+            prompt = argv[i + 1]
+            i += 2
+            continue
+        }
+        if a == "-l" or a == "--local" {
+            scope = "local"
+        } elif not a.starts_with("-") {
+            names.push(a)
+        }
+        i += 1
+    }
+    var line = null
+    let inp = cur_input()
+    if inp != null {
+        // consume one line of the piped input
+        if inp == "" {
+            return 1
+        }
+        let nl = inp.index_of("\n")
+        line = nl >= 0 ? inp[:nl] : inp
+        INPUT[-1] = nl >= 0 ? inp[nl + 1:] : ""
+    } else {
+        if prompt != "" {
+            os.write(prompt)
+        }
+        raw_mode(false)
+        line = os.read_line()
+        if line == null {
+            return 1
+        }
+    }
+    if len(names) == 0 {
+        names = ["REPLY"]
+    }
+    let parts = [p for p in line.split(" ") if p != ""]
+    var k = 0
+    for n in names {
+        if k == len(names) - 1 {
+            var_set(n, [join(parts[k:], " ")], scope)
+        } else {
+            var_set(n, [k < len(parts) ? parts[k] : ""], scope)
+        }
+        k += 1
+    }
+    return 0
+}
+
+fn builtin_type(argv) {
+    var quiet = false
+    var st = 0
+    for name in argv[1:] {
+        if name == "-q" or name == "--query" {
+            quiet = true
+            continue
+        }
+        var kind = null
+        if name in ALIASES {
+            kind = "an alias for '" + ALIASES[name] + "'"
+        } elif name in FUNCS {
+            kind = "a function"
+        } elif name in BUILTINS {
+            kind = "a builtin"
+        } elif os.which(name) != null {
+            kind = os.which(name)
+        }
+        if kind == null {
+            if not quiet {
+                err("type: ${name}: not found")
+            }
+            st = 1
+        } elif not quiet {
+            outl("${name} is ${kind}")
+        }
+    }
+    return st
+}
+
+fn builtin_history(argv) {
+    if len(argv) > 1 and (argv[1] == "clear" or argv[1] == "-c") {
+        HISTORY = []
+        os.write_file(history_path(), "", false)
+        return 0
+    }
+    var i = 1
+    for h in HISTORY {
+        outl("\e[90m" + " " * (5 - len(str(i))) + str(i) + "\e[0m  " + h)
+        i += 1
+    }
+    return 0
+}
+
+fn builtin_functions(argv) {
+    if len(argv) == 4 and (argv[1] == "-c" or argv[1] == "--copy") {
+        if not (argv[2] in FUNCS) and not try_autoload(argv[2]) {
+            err("functions --copy: ${argv[2]}: no such function")
+            return 1
+        }
+        let f = FUNCS[argv[2]]
+        FUNCS[argv[3]] = {k: "func", name: argv[3], body: f.body, args: f.args, desc: f.desc, events: []}
+        return 0
+    }
+    if len(argv) > 2 and (argv[1] == "-e" or argv[1] == "--erase") {
+        for n in argv[2:] {
+            if n in FUNCS {
+                remove(FUNCS, n)
+            }
+        }
+        return 0
+    }
+    if len(argv) > 2 and (argv[1] == "-q" or argv[1] == "--query") {
+        return all([n in FUNCS or try_autoload(n) for n in argv[2:]]) ? 0 : 1
+    }
+    for n in keys(FUNCS).sort() {
+        let d = FUNCS[n].desc
+        outl(n + (d != "" ? "\e[90m  - ${d}\e[0m" : ""))
+    }
+    return 0
+}
+
+fn builtin_status(argv) {
+    let sub = len(argv) > 1 ? argv[1].replace("--", "") : ""
+    if sub == "is-interactive" {
+        return INTERACTIVE ? 0 : 1
+    }
+    if sub == "is-login" {
+        return 1
+    }
+    if sub == "is-command-substitution" {
+        return len(OUTBUF) > 0 ? 0 : 1
+    }
+    outl(INTERACTIVE ? "This is an interactive shell." : "This is a non-interactive shell.")
+    return 0
+}
+
+// fish's set_color: names, br* names, hex, --bold/-o, --underline/-u,
+// --italics/-i, --dim/-d, --reverse/-r, --background=COLOR / -b COLOR
+const COLOR_CODES = {black: 0, red: 1, green: 2, yellow: 3, blue: 4, magenta: 5, cyan: 6, white: 7}
+
+fn color_sgr(name, bg) {
+    var n = name
+    var bright = false
+    if n.starts_with("br") and not n.starts_with("bright") {
+        n = n[2:]
+        bright = true
+    } elif n.starts_with("bright") {
+        n = n[6:]
+        bright = true
+    }
+    if n in COLOR_CODES {
+        let base = bright ? (bg ? 100 : 90) : (bg ? 40 : 30)
+        return str(base + COLOR_CODES[n])
+    }
+    var h = n.starts_with("#") ? n[1:] : n
+    if len(h) == 3 {
+        h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2]
+    }
+    if len(h) == 6 and all([c in "0123456789abcdefABCDEF" for c in h.chars()]) {
+        let hx = |s| hex_val(s)
+        return (bg ? "48" : "38") + ";2;${hx(h[0:2])};${hx(h[2:4])};${hx(h[4:6])}"
+    }
+    if n == "normal" or n == "reset" {
+        return "0"
+    }
+    return null
+}
+
+fn hex_val(s) {
+    var v = 0
+    for c in s.lower().chars() {
+        v = v * 16 + "0123456789abcdef".index_of(c)
+    }
+    return v
+}
+
+fn fish_color(args) {
+    var codes = []
+    var i = 0
+    while i < len(args) {
+        let a = args[i]
+        if a == "--bold" or a == "-o" {
+            codes.push("1")
+        } elif a == "--dim" or a == "-d" {
+            codes.push("2")
+        } elif a == "--italics" or a == "-i" {
+            codes.push("3")
+        } elif a == "--underline" or a == "-u" {
+            codes.push("4")
+        } elif a == "--reverse" or a == "-r" {
+            codes.push("7")
+        } elif a.starts_with("--background=") {
+            let c = color_sgr(a[13:], true)
+            if c != null {
+                codes.push(c)
+            }
+        } elif (a == "-b" or a == "--background") and i + 1 < len(args) {
+            let c = color_sgr(args[i + 1], true)
+            if c != null {
+                codes.push(c)
+            }
+            i += 1
+        } elif not a.starts_with("-") {
+            let c = color_sgr(a, false)
+            if c != null {
+                codes.push(c)
+            }
+        }
+        i += 1
+    }
+    return len(codes) > 0 ? "\e[" + join(codes, ";") + "m" : ""
+}
+
+fn builtin_set_color(argv) {
+    out(fish_color(argv[1:]))
+    return 0
+}
+
+// fish's ls: colors and type indicators on a terminal, plain when piped
+fn builtin_ls(argv) {
+    if LS_OPTS == null {
+        LS_OPTS = {color: [], ind: []}
+        for opt in ["--color=auto", "-G", "--color"] {
+            if os.run([["ls", opt, "/"]], {stdout: "/dev/null", stderr: "/dev/null"}).status == 0 {
+                LS_OPTS.color = [opt]
+                break
+            }
+        }
+        if os.run([["ls", "-F", "/"]], {stdout: "/dev/null", stderr: "/dev/null"}).status == 0 {
+            LS_OPTS.ind = ["-F"]
+        }
+    }
+    let tty = len(OUTBUF) == 0 and os.isatty(1)
+    var a = ["ls"] + LS_OPTS.color + (tty ? LS_OPTS.ind : [])
+    let n = argv[0]
+    if n == "ll" {
+        a = a + ["-lh"]
+    } elif n == "la" {
+        a = a + ["-lAh"]
+    }
+    return run_external([a + argv[1:]], [])
+}
+
+fn builtin_count(argv) {
+    var n = len(argv) - 1
+    if n == 0 {
+        let t = stdin_text()
+        if t != null {
+            n = len([l for l in t.split("\n") if l != ""])
+        }
+    }
+    outl(str(n))
+    return n > 0 ? 0 : 1
+}
+
+fn builtin_contains(argv) {
+    var i = 1
+    if i < len(argv) and argv[i] == "--" {
+        i += 1
+    }
+    if i >= len(argv) {
+        return 1
+    }
+    return argv[i] in argv[i + 1:] ? 0 : 1
+}
+
+fn builtin_string(argv) {
+    if len(argv) < 2 {
+        err("string: missing subcommand")
+        return 2
+    }
+    let sub = argv[1]
+    var args = [a for a in argv[2:] if a != "--"]
+    var flags = [a for a in args if a.starts_with("-") and len(a) > 1]
+    args = [a for a in args if not (a.starts_with("-") and len(a) > 1)]
+    var piped = null
+    if len(args) == 0 or (sub == "split" and len(args) == 1) or (sub == "join" and len(args) == 1) {
+        piped = stdin_text()
+    }
+    if piped != null and sub != "join" and sub != "split" {
+        args = [l for l in piped.split("\n") if l != ""]
+    }
+    let quiet = "-q" in flags or "--quiet" in flags
+    if sub == "upper" or sub == "lower" {
+        for a in args {
+            outl(sub == "upper" ? a.upper() : a.lower())
+        }
+        return 0
+    }
+    if sub == "length" {
+        for a in args {
+            if not quiet {
+                outl(str(len(a)))
+            }
+        }
+        return len(args) > 0 and len(args[0]) > 0 ? 0 : 1
+    }
+    if sub == "trim" {
+        for a in args {
+            outl(a.trim())
+        }
+        return 0
+    }
+    if sub == "join" {
+        var parts = args[1:]
+        if len(parts) == 0 and piped != null {
+            parts = [l for l in piped.split("\n") if l != ""]
+        }
+        outl(join(parts, args[0]))
+        return 0
+    }
+    if sub == "split" {
+        let sep = args[0]
+        var items_ = args[1:]
+        if len(items_) == 0 and piped != null {
+            items_ = [l for l in piped.split("\n") if l != ""]
+        }
+        for a in items_ {
+            for p in (sep == "" ? a.chars() : a.split(sep)) {
+                outl(p)
+            }
+        }
+        return 0
+    }
+    if sub == "replace" {
+        let pat = args[0]
+        let rep = args[1]
+        var any = false
+        for a in args[2:] {
+            if a.index_of(pat) >= 0 {
+                any = true
+            }
+            if not quiet {
+                outl(a.replace(pat, rep))
+            }
+        }
+        return any ? 0 : 1
+    }
+    if sub == "match" {
+        let pat = args[0]
+        var any = false
+        for a in args[1:] {
+            if os.fnmatch(pat, a) {
+                any = true
+                if not quiet {
+                    outl(a)
+                }
+            }
+        }
+        return any ? 0 : 1
+    }
+    err("string ${sub}: not supported (upper lower length trim join split replace match)")
+    return 2
+}
+
+fn builtin_jobs(argv) {
+    var i = 1
+    for j in JOBS {
+        outl("[${i}]  ${j.state}  ${j.cmd}")
+        i += 1
+    }
+    return 0
+}
+
+fn builtin_fg(argv) {
+    if len(JOBS) == 0 {
+        err("fg: no jobs")
+        return 1
+    }
+    let j = JOBS.pop()
+    outl(j.cmd)
+    let r = os.foreground(j.pgid)
+    if r.stopped {
+        j.state = "stopped"
+        JOBS.push(j)
+    }
+    return r.status
+}
+
+fn builtin_return(argv) {
+    FLAGS.ret = true
+    FLAGS.code = len(argv) > 1 ? int(argv[1]) : STATUS
+    return FLAGS.code
+}
+
+fn builtin_exit(argv) {
+    FLAGS.exit = true
+    FLAGS.code = len(argv) > 1 ? int(argv[1]) : STATUS
+    return FLAGS.code
+}
+
+fn builtin_break(argv) {
+    FLAGS.brk = true
+    return 0
+}
+
+fn builtin_continue(argv) {
+    FLAGS.cont = true
+    return 0
+}
+
+fn builtin_emit(argv) {
+    if len(argv) > 1 {
+        emit_event("event:" + argv[1])
+    }
+    return 0
+}
+
+fn builtin_fish_add_path(argv) {
+    var path = var_get1("PATH").split(":")
+    var added = 0
+    for d in argv[1:] {
+        if d.starts_with("-") or not is_dir(d) or d in path {
+            continue
+        }
+        path = [d] + path
+        added += 1
+    }
+    var_set("PATH", [join(path, ":")])
+    var_export("PATH")
+    return added > 0 ? 0 : 1
+}
+
+fn builtin_prompt_pwd(argv) {
+    outl(short_pwd())
+    return 0
+}
+
+fn builtin_fish_vcs_prompt(argv) {
+    let b = git_branch()
+    if b == "" {
+        return 1
+    }
+    out(" (${b})")
+    return 0
+}
+
+fn builtin_help(argv) {
+    outl("\e[1;36mspire\e[0m (Zsharpend edition) - a fish/bash-flavored shell written in Zsharpend")
+    outl("")
+    outl("syntax: if/else if/end or if/then/elif/fi, while/until, for, switch/case, function/end or f() {}")
+    outl("        begin/end, { }, cmd; and cmd; or cmd, not cmd, |, &&, ||, &, > >> < 2> &> 2>&1 <<<")
+    outl("        \$var \${var:-x} \$list[1] (cmd) \$(cmd) {a,b} * ? [..] ~")
+    outl("")
+    outl("builtins: " + join(keys(BUILTINS).sort(), " "))
+    outl("")
+    outl("keys: Tab complete (again to choose), → accept suggestion, ↑/↓ history (prefix search),")
+    outl("      Ctrl-A/E/U/K/W/L/C/D, Ctrl-R search history")
+    return 0
+}
+
+// fish's math: + - * / % ^ ( ), floats, and a few functions
+fn math_eval(toks) {
+    var pos = 0
+    let peek = || pos < len(toks) ? toks[pos] : ""
+    var expr = null
+    var primary = null
+    var power = null
+    primary = fn() {
+        let t = peek()
+        pos += 1
+        if t == "(" {
+            let v = expr()
+            pos += 1 // )
+            return v
+        }
+        if t == "-" {
+            return -primary()
+        }
+        if t in ["sqrt", "abs", "floor", "ceil", "round"] {
+            pos += 1 // (
+            let v = expr()
+            pos += 1 // )
+            if t == "sqrt" {
+                return sqrt(v)
+            }
+            if t == "abs" {
+                return abs(v)
+            }
+            if t == "floor" {
+                return floor(v)
+            }
+            if t == "ceil" {
+                return ceil(v)
+            }
+            return round(v)
+        }
+        if t == "pi" {
+            return PI
+        }
+        return float(t)
+    }
+    power = fn() {
+        let b = primary()
+        if peek() == "^" {
+            pos += 1
+            return pow(b, power())
+        }
+        return b
+    }
+    let term = fn() {
+        var v = power()
+        while peek() in ["*", "/", "%", "x"] {
+            let op = peek()
+            pos += 1
+            let r = power()
+            if op == "/" {
+                if r == 0 {
+                    throw "division by zero"
+                }
+                v = v / r
+            } elif op == "%" {
+                v = v - r * floor(v / r)
+            } else {
+                v = v * r
+            }
+        }
+        return v
+    }
+    expr = fn() {
+        var v = term()
+        while peek() == "+" or peek() == "-" {
+            let op = peek()
+            pos += 1
+            let r = term()
+            v = op == "+" ? v + r : v - r
+        }
+        return v
+    }
+    let v = expr()
+    if pos != len(toks) {
+        throw "unexpected '" + peek() + "'"
+    }
+    return v
+}
+
+fn builtin_math(argv) {
+    var scale = 6
+    var parts = []
+    var i = 1
+    while i < len(argv) {
+        if argv[i] == "-s" and i + 1 < len(argv) {
+            scale = int(argv[i + 1])
+            i += 2
+            continue
+        }
+        if argv[i].starts_with("-s") and len(argv[i]) > 2 {
+            scale = int(argv[i][2:])
+            i += 1
+            continue
+        }
+        parts.push(argv[i])
+        i += 1
+    }
+    let src = join(parts, " ")
+    var toks = []
+    var num = ""
+    var word = ""
+    for c in (src + " ").chars() {
+        if ("0" <= c and c <= "9") or c == "." {
+            num = num + c
+            continue
+        }
+        if num != "" {
+            toks.push(num)
+            num = ""
+        }
+        if "a" <= c and c <= "z" {
+            word = word + c
+            continue
+        }
+        if word != "" {
+            toks.push(word)
+            word = ""
+        }
+        if c != " " {
+            toks.push(c)
+        }
+    }
+    try {
+        let v = math_eval(toks)
+        if v == floor(v) and abs(v) < 1e15 {
+            outl(str(int(v)))
+        } else {
+            var s = format("%.${scale}f", v)
+            while s.index_of(".") >= 0 and (s.ends_with("0") or s.ends_with(".")) {
+                s = s[:-1]
+            }
+            outl(s)
+        }
+        return 0
+    } catch e {
+        err("math: ${e}: ${src}")
+        return 3
+    }
+}
+
+// command [-q|-s|-v] NAME [ARGS]: an external command, skipping functions
+fn builtin_command(argv) {
+    var i = 1
+    var query = false
+    var show = false
+    while i < len(argv) and argv[i].starts_with("-") {
+        let o = argv[i]
+        if o == "-q" or o == "--query" {
+            query = true
+        } elif o == "-s" or o == "-v" or o == "--search" {
+            show = true
+        }
+        i += 1
+    }
+    if i >= len(argv) {
+        return 1
+    }
+    if query or show {
+        var st = 0
+        for n in argv[i:] {
+            let p = os.which(n)
+            if p == null {
+                st = 1
+            } elif show {
+                outl(p)
+            }
+        }
+        return st
+    }
+    return run_external([argv[i:]], [])
+}
+
+fn builtin_builtin(argv) {
+    if len(argv) > 2 and (argv[1] == "-q" or argv[1] == "--query") {
+        return argv[2] in BUILTINS ? 0 : 1
+    }
+    if len(argv) < 2 or not (argv[1] in BUILTINS) {
+        err("builtin: ${len(argv) > 1 ? argv[1] : ""}: not a builtin")
+        return 1
+    }
+    return BUILTINS[argv[1]](argv[1:])
+}
+
+fn builtin_eval(argv) {
+    return run_source(join(argv[1:], " "))
+}
+
+fn builtin_isatty(argv) {
+    let w = len(argv) > 1 ? argv[1] : "stdin"
+    let fd = w == "stdout" ? 1 : w == "stderr" ? 2 : w == "stdin" ? 0 : int(w)
+    if fd == 1 and len(OUTBUF) > 0 {
+        return 1
+    }
+    return os.isatty(fd) ? 0 : 1
+}
+
+fn builtin_is_root(argv) {
+    return os.is_root() ? 0 : 1
+}
+
+// ---- trap ----
+
+const SIGNALS = {HUP: 1, INT: 2, QUIT: 3, USR1: 10, SEGV: 11, USR2: 12, PIPE: 13, ALRM: 14, TERM: 15,
+                 CHLD: 17, CONT: 18, TSTP: 20, TTIN: 21, TTOU: 22, WINCH: 28}
+var TRAPS = {}           // "EXIT", "ERR", or a signal name -> command text
+var IN_TRAP = false
+
+fn sig_name(s) {
+    var n = s.upper()
+    if n.starts_with("SIG") {
+        n = n[3:]
+    }
+    if n == "0" {
+        return "EXIT"
+    }
+    for (k, v) in items(SIGNALS) {
+        if str(v) == n {
+            return k
+        }
+    }
+    return n
+}
+
+fn builtin_trap(argv) {
+    if len(argv) == 1 or argv[1] == "-p" {
+        for (k, v) in items(TRAPS) {
+            outl("trap -- '${v}' ${k}")
+        }
+        return 0
+    }
+    if argv[1] == "-l" {
+        for (k, v) in items(SIGNALS) {
+            outl("${v}) SIG${k}")
+        }
+        return 0
+    }
+    var i = 1
+    if argv[i] == "--" {
+        i += 1
+    }
+    var action = argv[i]
+    var names = argv[i + 1:]
+    if len(names) == 0 {
+        // `trap SIG`: reset it
+        names = [action]
+        action = "-"
+    }
+    var st = 0
+    for raw in names {
+        let name = sig_name(raw)
+        if name != "EXIT" and name != "ERR" and not (name in SIGNALS) {
+            err("trap: ${raw}: invalid signal specification")
+            st = 1
+            continue
+        }
+        if action == "-" {
+            if name in TRAPS {
+                remove(TRAPS, name)
+            }
+            if name in SIGNALS {
+                os.trap(SIGNALS[name], "default")
+            }
+        } else {
+            TRAPS[name] = action
+            if name in SIGNALS {
+                os.trap(SIGNALS[name], action == "" ? "ignore" : "catch")
+            }
+        }
+    }
+    return st
+}
+
+fn run_trap(name) {
+    if IN_TRAP or not (name in TRAPS) or TRAPS[name] == "" {
+        return
+    }
+    IN_TRAP = true
+    let saved = STATUS
+    run_source(TRAPS[name])
+    STATUS = saved
+    IN_TRAP = false
+}
+
+// signals that arrived since the last check run their traps
+fn run_pending_traps() {
+    for num in os.pending_signals() {
+        for (k, v) in items(SIGNALS) {
+            if v == num {
+                run_trap(k)
+            }
+        }
+    }
+}
+
+fn shell_exit(code) {
+    run_trap("EXIT")
+    raw_mode(false)
+    os.exit(code)
+}
+
+// ---- printf ----
+
+fn printf_escapes(s, out_list) {
+    // \c stops all output: signalled through out_list[0]
+    var o = ""
+    let cs = s.chars()
+    var i = 0
+    while i < len(cs) {
+        if cs[i] == "\\" and i + 1 < len(cs) {
+            let e = cs[i + 1]
+            i += 2
+            if e == "n" {
+                o = o + "\n"
+            } elif e == "t" {
+                o = o + "\t"
+            } elif e == "r" {
+                o = o + "\r"
+            } elif e == "a" {
+                o = o + "\a"
+            } elif e == "e" or e == "E" {
+                o = o + "\e"
+            } elif e == "\\" {
+                o = o + "\\"
+            } elif e == "c" {
+                out_list[0] = true
+                return o
+            } elif e == "x" {
+                var h = ""
+                while i < len(cs) and len(h) < 2 and cs[i] in "0123456789abcdefABCDEF" {
+                    h = h + cs[i]
+                    i += 1
+                }
+                o = o + os.chr(hex_val(h))
+            } elif "0" <= e and e <= "7" {
+                var v = int(e)
+                var k = 1
+                while i < len(cs) and k < 3 and "0" <= cs[i] and cs[i] <= "7" {
+                    v = v * 8 + int(cs[i])
+                    i += 1
+                    k += 1
+                }
+                o = o + os.chr(v)
+            } else {
+                o = o + "\\" + e
+            }
+            continue
+        }
+        o = o + cs[i]
+        i += 1
+    }
+    return o
+}
+
+fn printf_int(a) {
+    if a == "" {
+        return 0
+    }
+    if (a.starts_with("'") or a.starts_with("\"")) and len(a) > 1 {
+        return os.ord(a[1])
+    }
+    try {
+        return parse_int(a)
+    } catch e {
+        err("printf: ${a}: invalid number")
+        return 0
+    }
+}
+
+fn shell_quote(v) {
+    if v != "" and all([c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-./=:,+@%" for c in v.chars()]) {
+        return v
+    }
+    return "'" + v.replace("'", "'\\''") + "'"
+}
+
+fn builtin_printf(argv) {
+    var i = 1
+    var target = null
+    if i + 1 < len(argv) and argv[i] == "-v" {
+        target = argv[i + 1]
+        i += 2
+    }
+    if i < len(argv) and argv[i] == "--" {
+        i += 1
+    }
+    if i >= len(argv) {
+        err("printf: usage: printf [-v var] format [arguments]")
+        return 2
+    }
+    let fmt = argv[i]
+    let args = argv[i + 1:]
+    var ai = 0
+    var o = ""
+    var stop = [false]
+    loop {
+        let before = ai
+        let cs = fmt.chars()
+        var k = 0
+        while k < len(cs) and not stop[0] {
+            let c = cs[k]
+            if c == "\\" and k + 1 < len(cs) {
+                // escapes in the format; \0NNN handled too
+                var j = k + 2
+                if cs[k + 1] == "x" or ("0" <= cs[k + 1] and cs[k + 1] <= "7") {
+                    while j < len(cs) and j < k + 5 and cs[j] in "0123456789abcdefABCDEF" {
+                        j += 1
+                    }
+                }
+                o = o + printf_escapes(join(cs[k:j], ""), stop)
+                k = j
+                continue
+            }
+            if c != "%" {
+                o = o + c
+                k += 1
+                continue
+            }
+            if k + 1 < len(cs) and cs[k + 1] == "%" {
+                o = o + "%"
+                k += 2
+                continue
+            }
+            // %[flags][width][.precision]conv
+            var j = k + 1
+            var spec = "%"
+            while j < len(cs) and cs[j] in "-+ #0" {
+                spec = spec + cs[j]
+                j += 1
+            }
+            if j < len(cs) and cs[j] == "*" {
+                spec = spec + str(ai < len(args) ? printf_int(args[ai]) : 0)
+                ai += 1
+                j += 1
+            }
+            while j < len(cs) and "0" <= cs[j] and cs[j] <= "9" {
+                spec = spec + cs[j]
+                j += 1
+            }
+            if j < len(cs) and cs[j] == "." {
+                spec = spec + "."
+                j += 1
+                if j < len(cs) and cs[j] == "*" {
+                    spec = spec + str(ai < len(args) ? printf_int(args[ai]) : 0)
+                    ai += 1
+                    j += 1
+                }
+                while j < len(cs) and "0" <= cs[j] and cs[j] <= "9" {
+                    spec = spec + cs[j]
+                    j += 1
+                }
+            }
+            while j < len(cs) and cs[j] in "hlLqjzt" and cs[j] != "q" {
+                j += 1
+            }
+            let conv = j < len(cs) ? cs[j] : "s"
+            k = j + 1
+            let a = ai < len(args) ? args[ai] : ""
+            if ai < len(args) {
+                ai += 1
+            }
+            if conv in "di" {
+                o = o + format(spec + "d", printf_int(a))
+            } elif conv in "uoxX" {
+                o = o + format(spec + conv, printf_int(a))
+            } elif conv in "feEgG" {
+                o = o + format(spec + conv, a == "" ? 0.0 : float(a))
+            } elif conv == "c" {
+                o = o + (a == "" ? "" : a[0])
+            } elif conv == "b" {
+                o = o + format(spec + "s", printf_escapes(a, stop))
+            } elif conv == "q" {
+                o = o + shell_quote(a)
+            } else {
+                o = o + format(spec + "s", a)
+            }
+        }
+        // the format repeats while arguments remain
+        if stop[0] or ai >= len(args) or ai == before {
+            break
+        }
+    }
+    if target != null {
+        var_set(target, [o])
+    } else {
+        out(o)
+    }
+    return 0
+}
+
+// ---- getopts ----
+
+var GETOPTS_CHAR = 1
+
+fn builtin_getopts(argv) {
+    if len(argv) < 3 {
+        err("getopts: usage: getopts optstring name [arg ...]")
+        return 2
+    }
+    var optstring = argv[1]
+    let name = argv[2]
+    let silent = optstring.starts_with(":")
+    if silent {
+        optstring = optstring[1:]
+    }
+    let args = len(argv) > 3 ? argv[3:] : (var_lookup("argv") ?? [])
+    var optind = 1
+    try {
+        optind = int(var_get1("OPTIND") == "" ? "1" : var_get1("OPTIND"))
+    } catch e {
+        optind = 1
+    }
+    var_erase("OPTARG")
+    if optind > len(args) {
+        GETOPTS_CHAR = 1
+        var_set(name, ["?"])
+        return 1
+    }
+    let cur = args[optind - 1]
+    if GETOPTS_CHAR == 1 and (not cur.starts_with("-") or cur == "-" or cur == "--") {
+        if cur == "--" {
+            var_set("OPTIND", [str(optind + 1)])
+        }
+        var_set(name, ["?"])
+        return 1
+    }
+    let opt = cur[GETOPTS_CHAR]
+    GETOPTS_CHAR += 1
+    let at_end = GETOPTS_CHAR >= len(cur)
+    let k = optstring.index_of(opt)
+    if k < 0 or opt == ":" {
+        var_set(name, ["?"])
+        if silent {
+            var_set("OPTARG", [opt])
+        } else {
+            err("getopts: illegal option -- ${opt}")
+        }
+    } elif k + 1 < len(optstring) and optstring[k + 1] == ":" {
+        if not at_end {
+            var_set("OPTARG", [cur[GETOPTS_CHAR:]])
+            optind += 1
+            GETOPTS_CHAR = 1
+        } elif optind < len(args) {
+            var_set("OPTARG", [args[optind]])
+            optind += 2
+            GETOPTS_CHAR = 1
+        } else {
+            optind += 1
+            GETOPTS_CHAR = 1
+            if silent {
+                var_set(name, [":"])
+                var_set("OPTARG", [opt])
+            } else {
+                var_set(name, ["?"])
+                err("getopts: option requires an argument -- ${opt}")
+            }
+            var_set("OPTIND", [str(optind)])
+            return 0
+        }
+        var_set(name, [opt])
+    } else {
+        var_set(name, [opt])
+    }
+    if at_end and GETOPTS_CHAR != 1 {
+        optind += 1
+        GETOPTS_CHAR = 1
+    }
+    var_set("OPTIND", [str(optind)])
+    return 0
+}
+
+fn builtin_shift(argv) {
+    let n = len(argv) > 1 ? int(argv[1]) : 1
+    let a = var_lookup("argv") ?? []
+    if n > len(a) {
+        return 1
+    }
+    var_set("argv", a[n:])
+    return 0
+}
+
+// bash's local: NAME or NAME=value, scoped to the running function
+fn builtin_local(argv) {
+    for a in argv[1:] {
+        let eq = a.index_of("=")
+        if eq > 0 {
+            var_set(a[:eq], [a[eq + 1:]], "local")
+        } else {
+            var_set(a, var_lookup(a) == null ? [] : [""], "local")
+        }
+    }
+    return 0
+}
+
+fn builtin_true(argv) {
+    return 0
+}
+
+fn builtin_false(argv) {
+    return 1
+}
+
+fn builtin_pwd(argv) {
+    outl(os.cwd())
+    return 0
+}
+
+const BUILTINS = {
+    "cd": builtin_cd,
+    "echo": builtin_echo,
+    "set": builtin_set,
+    "export": builtin_export,
+    "unset": builtin_unset,
+    "alias": builtin_alias,
+    "abbr": builtin_abbr,
+    "source": builtin_source,
+    "read": builtin_read,
+    "type": builtin_type,
+    "history": builtin_history,
+    "functions": builtin_functions,
+    "status": builtin_status,
+    "set_color": builtin_set_color,
+    "ls": builtin_ls,
+    "ll": builtin_ls,
+    "la": builtin_ls,
+    "count": builtin_count,
+    "contains": builtin_contains,
+    "string": builtin_string,
+    "jobs": builtin_jobs,
+    "fg": builtin_fg,
+    "return": builtin_return,
+    "exit": builtin_exit,
+    "break": builtin_break,
+    "continue": builtin_continue,
+    "emit": builtin_emit,
+    "fish_add_path": builtin_fish_add_path,
+    "prompt_pwd": builtin_prompt_pwd,
+    "fish_vcs_prompt": builtin_fish_vcs_prompt,
+    "fish_git_prompt": builtin_fish_vcs_prompt,
+    "help": builtin_help,
+    "true": builtin_true,
+    "false": builtin_false,
+    "pwd": builtin_pwd,
+    "math": builtin_math,
+    "test": builtin_test,
+    "trap": builtin_trap,
+    "complete": builtin_complete,
+    "commandline": builtin_commandline,
+    "printf": builtin_printf,
+    "getopts": builtin_getopts,
+    "shift": builtin_shift,
+    "local": builtin_local,
+    "[": builtin_test,
+    "bind": builtin_bind,
+    "command": builtin_command,
+    "builtin": builtin_builtin,
+    "eval": builtin_eval,
+    "isatty": builtin_isatty,
+    "fish_is_root_user": builtin_is_root
+}

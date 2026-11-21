@@ -1,0 +1,10 @@
+2
+procsub
+errexit=[]
+cond-ok
+pipefail=1
+no-pipefail=0
++ echo traced
+traced
+picked banana (2)
+end

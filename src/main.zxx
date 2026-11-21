@@ -1,0 +1,182 @@
+// spire, the shell — written in Zsharpend.
+//
+//   whetstone run examples/spire                 interactive
+//   whetstone run examples/spire -- -c 'cmd'     run a command
+//   whetstone run examples/spire -- script.fish  run a script
+//
+// It needs the `os` script extender (see spire.wtf) for the terminal,
+// processes and files.
+
+import os
+
+#include "lex.zxx"
+#include "parse.zxx"
+#include "vars.zxx"
+#include "expand.zxx"
+#include "arith.zxx"
+#include "exec.zxx"
+#include "builtins.zxx"
+#include "edit.zxx"
+#include "complete.zxx"
+#include "bind.zxx"
+
+var INTERACTIVE = false
+
+fn history_path() {
+    return os.home() + "/.local/share/spire/history"
+}
+
+fn load_history() {
+    let t = os.read_file(history_path())
+    if t != null {
+        HISTORY = [l for l in t.split("\n") if l != ""]
+    }
+}
+
+fn add_history(line) {
+    if line.trim() == "" or line.starts_with(" ") {
+        return
+    }
+    if len(HISTORY) > 0 and HISTORY[-1] == line {
+        return
+    }
+    HISTORY.push(line)
+    os.mkdir(os.home() + "/.local/share/spire")
+    os.write_file(history_path(), line + "\n", true)
+}
+
+fn fish_dir() {
+    let x = os.getenv("XDG_CONFIG_HOME")
+    return (x != null and x != "" ? x : os.home() + "/.config") + "/fish"
+}
+
+fn fish_function_file(name) {
+    if name.index_of("/") >= 0 or name == "" {
+        return null
+    }
+    let p = fish_dir() + "/functions/" + name + ".fish"
+    return os.stat(p) != null ? p : null
+}
+
+// fish autoloading: functions/NAME.fish defines NAME on first use
+var AUTOLOADED = {}
+
+fn try_autoload(name) {
+    if name in FUNCS {
+        return true
+    }
+    if name in AUTOLOADED {
+        return false
+    }
+    AUTOLOADED[name] = true
+    let p = fish_function_file(name)
+    if p == null {
+        return false
+    }
+    run_source(os.read_file(p) ?? "", p)
+    return name in FUNCS
+}
+
+// the user's fish setup: conf.d/*.fish, then config.fish
+fn load_fish_config() {
+    let d = fish_dir()
+    for f in (os.listdir(d + "/conf.d") ?? []).sort() {
+        if f.ends_with(".fish") {
+            let p = d + "/conf.d/" + f
+            run_source(os.read_file(p) ?? "", p)
+        }
+    }
+    let cfg = d + "/config.fish"
+    let t = os.read_file(cfg)
+    if t != null {
+        run_source(t, cfg)
+    }
+    FLAGS.exit = false
+}
+
+fn greeting() {
+    if "fish_greeting" in FUNCS or try_autoload("fish_greeting") {
+        call_function(FUNCS["fish_greeting"], ["fish_greeting"])
+        return
+    }
+    let g = var_lookup("fish_greeting")
+    if g != null and join(g, "") != "" {
+        outl(join(g, " "))
+    }
+}
+
+fn repl() {
+    INTERACTIVE = true
+    os.interactive()
+    load_history()
+    load_fish_config()
+    greeting()
+    while not FLAGS.exit {
+        reap_jobs()
+        run_pending_traps()
+        emit_event("event:fish_prompt")
+        let pr = make_prompt()
+        // dim ⏎ marks output that didn't end with a newline (as fish does)
+        let W = os.term_size()[0]
+        os.write("\e[90m⏎\e[0m" + " " * (W - 1) + "\r\e[K")
+        var line = read_line_interactive(pr[0], pr[1], true)
+        if line == null {
+            os.write("\n")
+            break
+        }
+        // keep reading while a block or quote is open
+        var r = parse_program(line)
+        while r.status == "incomplete" {
+            let more = read_line_interactive("\e[90m  …\e[0m ", "", false)
+            if more == null {
+                break
+            }
+            line = line + "\n" + more
+            r = parse_program(line)
+        }
+        add_history(line)
+        if r.status == "error" {
+            err(r.err)
+            STATUS = 2
+            continue
+        }
+        if r.status != "ok" {
+            continue
+        }
+        emit_event("event:fish_preexec")
+        let t0 = os.time_ms()
+        run_node(r.node)
+        var_set("CMD_DURATION", [str(os.time_ms() - t0)], "global")
+        FLAGS.brk = false
+        FLAGS.cont = false
+        FLAGS.ret = false
+        emit_event("event:fish_postexec")
+    }
+    shell_exit(FLAGS.exit ? FLAGS.code : STATUS)
+}
+
+fn Main() {
+    vars_import_env()
+    run_source(FISH_HELPERS)
+    let args = os.args()
+    if len(args) >= 2 and args[0] == "-c" {
+        var_set("argv", args[2:])
+        let st = run_source(args[1])
+        shell_exit(FLAGS.exit ? FLAGS.code : st)
+    }
+    if len(args) >= 1 and not args[0].starts_with("-") {
+        let t = os.read_file(args[0])
+        if t == null {
+            err("${args[0]}: can't read")
+            os.exit(127)
+        }
+        var_set("argv", args[1:])
+        let st = run_source(t, args[0])
+        shell_exit(FLAGS.exit ? FLAGS.code : st)
+    }
+    if os.isatty(0) and os.isatty(1) {
+        repl()
+    }
+    let st = run_source(os.read_all())
+    shell_exit(FLAGS.exit ? FLAGS.code : st)
+}
