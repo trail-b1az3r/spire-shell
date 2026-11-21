@@ -58,6 +58,18 @@ toy. It is, however, a big project built in one sitting, so see
 
 ### Interactive: completion, editing, color
 
+- **fish's colors, 1:1, by default.** Syntax highlighting, autosuggestions
+  and the completion pager use fish's default theme (commands in the
+  terminal's normal color, arguments cyan, quotes yellow, errors bright red,
+  `;`/`|`/`&` green, redirections bold cyan, comments red, descriptions
+  yellow italic, the typed prefix bold+underlined). The prompt looks like
+  fish's: `user@host ~/s/project (branch) [1]> `. `colorscheme spire`
+  brings back spire's own palette.
+- **`ls`, `ll` and `la` behave like fish's functions**: color and `-F` type
+  indicators on a terminal, plain when piped, `ll` = `ls -lh`,
+  `la` = `ls -lAh` — so `ll` or `ls -la` is colored with no aliases. With
+  no `$LS_COLORS`, spire loads the full palette from `dircolors`.
+
 - **Context-aware Tab completion** with a fish/zsh-style menu: candidates
   are laid out in a grid with **descriptions**, colored by kind (files use
   your `LS_COLORS`), and repeated Tab / Shift-Tab / arrow keys move a
@@ -255,7 +267,7 @@ with a dirty marker, `%?` last exit status, `%E` `✘ N` only after a failure,
 command if it was slow, `%T` `%*` `%t` time, `%D{strftime}`, `%v`
 virtualenv, `%h` history number, `%#` `#`/`$`, `%F{color}…%f` and
 `%K{color}…%k` foreground/background, `%B…%b` bold, `%U…%u` underline,
-`%(?.yes.no)` conditionals (`?` success, `j` jobs, `#` root, `N` status N),
+`%P` fish-style shortened cwd (`~/s/project`), `%(?.yes.no)` conditionals (`?` success, `j` jobs, `#` root, `N` status N),
 `%%` a literal `%`.
 
 Color values: `black red green yellow blue magenta cyan white default`,

@@ -240,7 +240,24 @@ static size_t render_menu(LState *s, dstr_t *out, size_t W) {
             else ds_append(out, col);
             /* text, truncated to its column */
             size_t tw = display_width(disp);
-            if (tw > L.textw) {
+            /* fish's pager: the part already typed is shown in its own style */
+            size_t pre = 0;
+            if (!selected && s->comp_orig) {
+                const char *typed = strrchr(s->comp_orig, '/');
+                typed = typed ? typed + 1 : s->comp_orig;
+                if (*typed == '"' || *typed == '\'') typed++;
+                size_t tl = strlen(typed);
+                if (tl && tl <= strlen(disp) && strncasecmp(disp, typed, tl) == 0 && tw <= L.textw) pre = tl;
+            }
+            if (pre) {
+                char *pc = ansi_code_for(config_color("completion_prefix"));
+                ds_append(out, ANSI_RESET); ds_append(out, pc); ds_append(out, col);
+                ds_append_n(out, disp, pre);
+                ds_append(out, ANSI_RESET); ds_append(out, col);
+                ds_append(out, disp + pre);
+                used = tw;
+                free(pc);
+            } else if (tw > L.textw) {
                 size_t k = 0, w = 0;
                 while (disp[k] && w + 1 < L.textw) { size_t st = k; k++; while (disp[k] && ((unsigned char)disp[k] & 0xC0) == 0x80) k++; w += display_width_n(disp + st, k - st); }
                 ds_append_n(out, disp, k); ds_append(out, "…");

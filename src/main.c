@@ -8,6 +8,7 @@
 #include "config.h"
 #include "history.h"
 #include "modules.h"
+#include "fishfuncs.h"
 #include "lineedit.h"
 #include "exec.h"
 #include "parser.h"
@@ -36,6 +37,12 @@ static void init_shell_process(bool interactive) {
     g_shell_is_interactive = interactive;
 }
 
+static void apply_scheme(const char *name) {
+    BuiltinFn cs = builtin_lookup("colorscheme");
+    char *argv[] = { (char *)"colorscheme", (char *)name, NULL };
+    if (cs) cs(2, argv);
+}
+
 static void init_subsystems(void) {
     vars_init();
     exec_init();
@@ -45,9 +52,11 @@ static void init_subsystems(void) {
     builtins_init();
     jobs_init();
     config_init();
+    config_scheme_hook = apply_scheme;
     config_load_default();
     history_init(config_history_size(), config_history_path());
     lineedit_init();
+    fishfuncs_install();
     modules_load_enabled();
 
     var_set("SPIRE_VERSION", SPIRE_VERSION, true);

@@ -139,6 +139,33 @@ static void render_into(const char *fmt, dstr_t *outp) {
                 p++; break;
             }
             case '~': append_shortened_cwd(&out); p++; break;
+            case 'P': {
+                /* fish's prompt_pwd: ~ for $HOME, every directory but the
+                 * last shortened to one character (".c" for hidden ones) */
+                char cwd[4096];
+                if (!getcwd(cwd, sizeof(cwd))) { p++; break; }
+                dstr_t full; ds_init(&full);
+                const char *home = var_get("HOME");
+                size_t hl = home ? strlen(home) : 0;
+                if (hl > 1 && strncmp(cwd, home, hl) == 0 && (cwd[hl] == '/' || cwd[hl] == '\0')) { ds_append_c(&full, '~'); ds_append(&full, cwd + hl); }
+                else ds_append(&full, cwd);
+                const char *s = full.data;
+                const char *last = strrchr(s, '/');
+                for (const char *q = s; *q; ) {
+                    if (last && q < last && *q != '/') {
+                        const char *e = strchr(q, '/');
+                        size_t keep = (*q == '.' && e - q > 1) ? 2 : 1;
+                        ds_append_n(&out, q, keep);
+                        q = e;
+                        continue;
+                    }
+                    if (!last || q >= last) { ds_append(&out, q); break; }
+                    ds_append_c(&out, *q++);
+                }
+                ds_free(&full);
+                p++;
+                break;
+            }
             case 'd': {
                 char cwd[4096];
                 if (getcwd(cwd, sizeof(cwd))) ds_append(&out, cwd);

@@ -2,11 +2,8 @@
 # Enable it by adding "aliases" to the `modules = ...` line in
 # ~/.config/spire/spire.conf, or run `module load aliases` at any time.
 
-# colors for the usual suspects
-alias ls='ls --color=auto'
-alias ll='ls -la --color=auto'
-alias la='ls -A --color=auto'
-alias l='ls -CF --color=auto'
+# colors for the usual suspects (ls, ll and la are built in, fish-style)
+alias l='ls -CF'
 alias grep='grep --color=auto'
 alias egrep='grep -E --color=auto'
 alias fgrep='grep -F --color=auto'

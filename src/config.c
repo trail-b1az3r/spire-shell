@@ -5,10 +5,10 @@
 
 #define CFG_BUCKETS 128
 
-/* user@host ~/dir (branch*) ▲❯   -- the arrow turns red after a failed command */
-#define DEFAULT_PROMPT "%F{cyan}%n%f@%F{cyan}%m%f %F{yellow}%~%f %F{brightblack}%G%f%(?.%F{green}.%F{red})▲❯%f "
-/* right side: exit status of a failed command, slow-command duration, job count */
-#define DEFAULT_RPROMPT "%(?..%F{red}✘ %?%f )%F{yellow}%c%f%F{brightblack}%J%f"
+/* fish's look: user@host ~/s/dir (branch) [status]>  -- see `colorscheme spire` for the old one */
+#define DEFAULT_PROMPT "%F{brightgreen}%n%f@%m %(#.%F{red}.%F{green})%P%f %G%(?..%F{red}[%?]%f )%(#.#.>) "
+/* fish has no right prompt by default */
+#define DEFAULT_RPROMPT ""
 
 typedef struct CfgEntry {
     char *key;
@@ -17,6 +17,7 @@ typedef struct CfgEntry {
 } CfgEntry;
 
 static CfgEntry *buckets[CFG_BUCKETS];
+void (*config_scheme_hook)(const char *name) = NULL;
 static strvec_t g_modules;
 static char g_cfgdir[1100];
 static char g_histpath[1100];
@@ -66,32 +67,33 @@ void config_init(void) {
      * has good emoji coverage. */
     config_set("prompt", DEFAULT_PROMPT);
     config_set("rprompt", DEFAULT_RPROMPT);
-    config_set("color.command", "green");
-    config_set("color.command_invalid", "red");
-    config_set("color.builtin", "blue");
+    config_set("color.command", "default");
+    config_set("color.command_invalid", "brightred");
+    config_set("color.builtin", "default");
     config_set("color.string", "yellow");
-    config_set("color.variable", "cyan");
-    config_set("color.operator", "magenta");
-    config_set("color.comment", "brightblack");
-    config_set("color.keyword", "blue");
-    config_set("color.number", "magenta");
-    config_set("color.path", "white");
-    config_set("color.array", "brightmagenta");
-    config_set("color.flag", "brightcyan");
+    config_set("color.variable", "brightcyan");
+    config_set("color.operator", "green");
+    config_set("color.comment", "red");
+    config_set("color.keyword", "default");
+    config_set("color.number", "cyan");
+    config_set("color.path", "cyan");
+    config_set("color.array", "cyan");
+    config_set("color.flag", "cyan");
     config_set("color.suggestion", "brightblack");
-    config_set("color.text", "default");
-    config_set("color.function", "brightblue");
-    config_set("color.redirect", "brightmagenta");
+    config_set("color.text", "cyan");
+    config_set("color.function", "default");
+    config_set("color.redirect", "bold-cyan");
     config_set("color.escape", "brightcyan");
-    config_set("color.description", "brightblack");
+    config_set("color.description", "italic-yellow");
     config_set("color.selection", "reverse");
     config_set("color.completion", "default");
-    config_set("color.error", "red");
+    config_set("color.error", "brightred");
     config_set("prompt.duration_threshold", "2000");
     config_set("autocd", "yes");
     config_set("autosuggest", "yes");
     config_set("complete.parse_help", "yes");
     config_set("highlight.valid_paths", "yes");
+    config_set("color.completion_prefix", "bold-underline-default");
     config_set("history.size", "5000");
 }
 
@@ -148,6 +150,7 @@ void config_load(const char *path) {
         size_t vl = strlen(val);
         if (vl >= 2 && val[0] == '"' && val[vl-1] == '"') { val[vl-1] = '\0'; val++; }
         if (strcmp(key, "modules") == 0) { parse_modules_csv(val); continue; }
+        if (strcmp(key, "colorscheme") == 0) { if (config_scheme_hook) config_scheme_hook(val); continue; }
         config_set(key, val);
     }
     fclose(f);
@@ -164,23 +167,10 @@ void config_load_default(void) {
         if (f) {
             fprintf(f,
                 "# spire configuration - see `man spire` / README for the full key list\n"
-                "prompt = \"%%F{cyan}%%n%%f@%%F{cyan}%%m%%f %%F{yellow}%%~%%f %%F{brightblack}%%G%%f%%(?.%%F{green}.%%F{red})▲❯%%f \"\n"
-                "rprompt = \"%%(?..%%F{red}✘ %%?%%f )%%F{yellow}%%c%%f%%F{brightblack}%%J%%f\"\n"
-                "color.command = green\n"
-                "color.command_invalid = red\n"
-                "color.builtin = blue\n"
-                "color.string = yellow\n"
-                "color.variable = cyan\n"
-                "color.operator = magenta\n"
-                "color.comment = brightblack\n"
-                "color.keyword = blue\n"
-                "color.number = magenta\n"
-                "color.path = white\n"
-                "color.array = brightmagenta\n"
-                "color.flag = brightcyan\n"
-                "color.suggestion = brightblack\n"
-                "color.redirect = brightmagenta\n"
-                "color.description = brightblack\n"
+                "prompt = \"%%F{brightgreen}%%n%%f@%%m %%(#.%%F{red}.%%F{green})%%P%%f %%G%%(?..%%F{red}[%%?]%%f )%%(#.#.>) \"\n"
+                "rprompt = \"\"\n"
+                "# fish's default theme (run `colorscheme` to see all colors)\n"
+                "colorscheme = fish\n"
                 "history.size = 5000\n"
                 "modules = \n");
             fclose(f);

@@ -657,6 +657,8 @@ static void parse_help_text(const char *text, CandList *out) {
 }
 
 static void add_help_options(const char *cmd, CandList *out) {
+    /* ll and la wrap ls (like fish's --wraps) */
+    if (strcmp(cmd, "ll") == 0 || strcmp(cmd, "la") == 0) cmd = "ls";
     const char *cfg = config_get("complete.parse_help", "yes");
     if (strcmp(cfg, "no") == 0) return;
     for (int i = 0; i < g_help_n; i++) {

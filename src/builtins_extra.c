@@ -897,12 +897,33 @@ static int b_which(int argc, char **argv) {
 
 static int b_command(int argc, char **argv) {
     int i = 1;
-    bool v = false, V = false;
+    bool v = false, V = false, search = false, quiet = false, all = false;
     for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
         if (strcmp(argv[i], "--") == 0) { i++; break; }
-        for (const char *p = argv[i] + 1; *p; p++) { if (*p == 'v') v = true; else if (*p == 'V') V = true; }
+        if (strcmp(argv[i], "--search") == 0) { search = true; continue; }
+        if (strcmp(argv[i], "--query") == 0) { search = quiet = true; continue; }
+        if (strcmp(argv[i], "--all") == 0) { search = all = true; continue; }
+        for (const char *p = argv[i] + 1; *p; p++) {
+            if (*p == 'v') v = true; else if (*p == 'V') V = true;
+            else if (*p == 's') search = true;               /* fish: command -s NAME prints its path */
+            else if (*p == 'q') { search = true; quiet = true; } /* fish: command -q NAME tests it */
+            else if (*p == 'a') { search = true; all = true; }
+        }
     }
-    if (i >= argc) return 0;
+    if (i >= argc) return search ? 1 : 0;
+    if (search) {
+        /* fish's `command -s/-q/-a`: only external commands count */
+        int found = 0;
+        for (; i < argc; i++) {
+            strvec_t paths; sv_init(&paths);
+            if (path_lookup(argv[i], &paths, all)) {
+                found++;
+                if (!quiet) for (size_t k = 0; k < paths.count; k++) printf("%s\n", paths.items[k]);
+            }
+            sv_free(&paths);
+        }
+        return found ? 0 : 1;
+    }
     if (v || V) {
         int status = 0;
         for (; i < argc; i++) {
@@ -948,6 +969,19 @@ static int b_exec(int argc, char **argv) {
 }
 
 static int b_colon(int argc, char **argv) { (void)argc; (void)argv; return 0; }
+
+/* fish: isatty [stdin|stdout|stderr|FD] (default stdin) */
+static int b_isatty(int argc, char **argv) {
+    int fd = 0;
+    if (argc > 1) {
+        if (strcmp(argv[1], "stdin") == 0) fd = 0;
+        else if (strcmp(argv[1], "stdout") == 0) fd = 1;
+        else if (strcmp(argv[1], "stderr") == 0) fd = 2;
+        else fd = atoi(argv[1]);
+    }
+    fflush(stdout);
+    return isatty(fd) ? 0 : 1;
+}
 
 static int b_source(int argc, char **argv) {
     if (argc < 2) { sh_err("source: filename required\n"); return 2; }
@@ -1970,7 +2004,7 @@ static BuiltinEntry g_extra[] = {
     {"echo", b_echo}, {"printf", b_printf}, {"read", b_read},
     {"test", test_eval}, {"[", test_eval},
     {"type", b_type}, {"which", b_which}, {"command", b_command}, {"builtin", b_builtin},
-    {"eval", b_eval}, {"exec", b_exec}, {":", b_colon}, {"source", b_source}, {".", b_source},
+    {"eval", b_eval}, {"exec", b_exec}, {":", b_colon}, {"isatty", b_isatty}, {"source", b_source}, {".", b_source},
     {"shift", b_shift}, {"getopts", b_getopts},
     {"jobs", b_jobs}, {"fg", b_fg}, {"bg", b_bg}, {"wait", b_wait}, {"kill", b_kill},
     {"disown", b_disown}, {"trap", b_trap}, {"umask", b_umask},

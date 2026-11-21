@@ -209,7 +209,45 @@ static int b_colorscheme(int argc, char **argv) {
         return 0;
     }
     if (strcmp(argv[1], "list") == 0) {
-        printf("dark\nlight\nmono\nsolarized\nnord\ngruvbox\ndracula\n");
+        printf("fish\nspire\ndark\nlight\nmono\nsolarized\nnord\ngruvbox\ndracula\n");
+        return 0;
+    }
+    if (strcmp(argv[1], "fish") == 0) {
+        config_set("color.command", "default");
+        config_set("color.command_invalid", "brightred");
+        config_set("color.builtin", "default");
+        config_set("color.function", "default");
+        config_set("color.keyword", "default");
+        config_set("color.string", "yellow");
+        config_set("color.variable", "brightcyan");
+        config_set("color.operator", "green");
+        config_set("color.redirect", "bold-cyan");
+        config_set("color.comment", "red");
+        config_set("color.number", "cyan");
+        config_set("color.path", "cyan");
+        config_set("color.array", "cyan");
+        config_set("color.flag", "cyan");
+        config_set("color.escape", "brightcyan");
+        config_set("color.suggestion", "brightblack");
+        config_set("color.text", "cyan");
+        config_set("color.description", "italic-yellow");
+        config_set("color.selection", "reverse");
+        config_set("color.completion", "default");
+        config_set("color.completion_prefix", "bold-underline-default");
+        config_set("color.error", "brightred");
+        return 0;
+    }
+    if (strcmp(argv[1], "spire") == 0) {
+        /* spire 1.1's own palette */
+        config_set("color.command", "green"); config_set("color.command_invalid", "red");
+        config_set("color.builtin", "blue"); config_set("color.function", "brightblue");
+        config_set("color.string", "yellow"); config_set("color.variable", "cyan");
+        config_set("color.operator", "magenta"); config_set("color.redirect", "brightmagenta");
+        config_set("color.comment", "brightblack"); config_set("color.keyword", "blue");
+        config_set("color.number", "magenta"); config_set("color.path", "white");
+        config_set("color.array", "brightmagenta"); config_set("color.flag", "brightcyan");
+        config_set("color.escape", "brightcyan"); config_set("color.text", "default");
+        config_set("color.description", "brightblack"); config_set("color.completion_prefix", "default");
         return 0;
     }
     if (strcmp(argv[1], "dark") == 0) {
@@ -256,7 +294,7 @@ static int b_colorscheme(int argc, char **argv) {
         config_set("color.number", "215"); config_set("color.flag", "117");
     } else {
         sh_err("colorscheme: unknown scheme '%s' "
-                         "(try dark, light, mono, solarized, nord, gruvbox, dracula)\n", argv[1]);
+                         "(try fish, spire, dark, light, mono, solarized, nord, gruvbox, dracula)\n", argv[1]);
         return 1;
     }
     /* classes added later follow the preset's closest relatives */
