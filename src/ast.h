@@ -76,6 +76,7 @@ typedef struct Node {
 Node *node_new(NodeType type);
 void node_add_child(Node *n, Node *child);
 void node_free(Node *n);
+Node *node_clone(const Node *n); /* deep copy (functions --copy) */
 Redirect *redirect_new(RedirType type, const char *target);
 
 #endif

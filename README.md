@@ -67,8 +67,13 @@ completions in `completions/` are autoloaded on first use. Your
 declared `--on-event fish_prompt / fish_preexec / fish_postexec` or
 `--on-variable PWD` fire, and the builtins and helpers configs reach for
 exist: `set_color` (names, `br*`, hex, `--bold`, `--background=`),
-`alias NAME 'cmd …'`, `abbr`, `bind`, `commandline`, `emit`, `psub`,
+`alias NAME 'cmd …'`, `abbr`, `emit`, `psub`,
 `fish_add_path`, `prompt_pwd`, `fish_vcs_prompt`/`fish_git_prompt`,
+`functions --copy`, `bind` (real key bindings: fish input functions like
+`forward-char` or `history-search-backward`, or any command, in old
+`\\cf`/`\\e[A` or new `ctrl-f`/`alt-x`/`up` notation, `-k` names, `-e`),
+`commandline` that reads *and changes* the line (`-r`, `-i`, `-a`, `-t`,
+`-C`, `-f`),
 `type -q`, `command -q/-s`, `status --is-interactive`, `isatty`,
 `string split -f`, `__fish_seen_subcommand_from` and friends. `cmd | source`
 and `cmd | read` run in the shell, so `zoxide init fish | source`-style

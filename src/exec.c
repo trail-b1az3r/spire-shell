@@ -682,6 +682,18 @@ static void expand_decl_argv(strvec_t *raw, strvec_t *out) {
     }
 }
 
+/* bind's words keep fish key escapes (\\cf, \\e[A): unquoted words that
+ * contain a backslash pass through as written, quotes are just removed */
+static void expand_bind_argv(strvec_t *raw, strvec_t *out) {
+    for (size_t i = 0; i < raw->count; i++) {
+        const char *w = raw->items[i];
+        size_t n = strlen(w);
+        if (n >= 2 && w[0] == '\'' && w[n - 1] == '\'') { sv_push(out, xstrndup(w + 1, n - 2)); continue; }
+        if (i > 0 && strchr(w, '\\') && w[0] != '"') { sv_push_dup(out, w); continue; }
+        expand_word(w, out);
+    }
+}
+
 int exec_eval_string(const char *src) {
     Node *root; char *err = NULL;
     ParseStatus st = parse_program(src, &root, &err);
@@ -745,6 +757,7 @@ static int exec_simple_command(Node *n) {
 
     strvec_t argv; sv_init(&argv);
     if (is_decl_builtin(n->argv.items[0]) && func_get(n->argv.items[0]) == NULL) expand_decl_argv(&n->argv, &argv);
+    else if (strcmp(n->argv.items[0], "bind") == 0 && func_get("bind") == NULL) expand_bind_argv(&n->argv, &argv);
     else expand_argv_with_aliases(&n->argv, &argv, 0);
     if (argv.count == 0) {
         sv_free(&argv);

@@ -22,4 +22,20 @@ size_t lineedit_cursor(void);
  * next primary prompt instead of the configured format; NULL = none */
 void lineedit_set_prompt_override(const char *left, const char *right);
 
+/* `commandline` edits, for commands run from key bindings */
+bool lineedit_active(void);
+void lineedit_replace(const char *text);
+void lineedit_replace_token(const char *text);
+void lineedit_insert(const char *text);
+void lineedit_append(const char *text);
+void lineedit_set_cursor(size_t pos);
+
+/* `bind`: key notation -> byte sequences, and the binding table */
+void lineedit_key_seqs(const char *spec, bool terminfo_name, strvec_t *out);
+void lineedit_bind(const char *seq, const char *spec, int nact, char **acts);
+bool lineedit_unbind(const char *seq);
+void lineedit_list_binds(strvec_t *out);
+void lineedit_list_functions(strvec_t *out);
+bool lineedit_queue_function(const char *name); /* commandline -f */
+
 #endif

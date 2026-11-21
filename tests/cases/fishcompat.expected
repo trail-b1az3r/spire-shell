@@ -14,3 +14,8 @@ dashdash-ok
 not-login
 switch-ok
 3 c
+orig x
+replaced
+bind \cg 'commandline -r hi'
+bind up history-search-backward
+1

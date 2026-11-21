@@ -15,6 +15,7 @@
 #include "highlight.h"
 #include "config.h"
 #include "lineedit.h"
+#include "fishfuncs.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -1393,6 +1394,16 @@ static int b_history(int argc, char **argv) {
 }
 
 static int b_functions(int argc, char **argv) {
+    if (argc > 1 && (strcmp(argv[1], "-c") == 0 || strcmp(argv[1], "--copy") == 0)) {
+        /* fish: functions --copy OLD NEW */
+        if (argc != 4) { sh_err("functions --copy: expected OLD NEW\n"); return 2; }
+        Node *fn = func_get(argv[2]);
+        if (!fn && !fish_autoload_function(argv[2])) { sh_err("functions --copy: %s: no such function\n", argv[2]); return 1; }
+        fn = func_get(argv[2]);
+        if (func_get(argv[3])) { sh_err("functions --copy: %s already exists\n", argv[3]); return 2; }
+        func_define(argv[3], node_clone(fn));
+        return 0;
+    }
     if (argc > 2 && (strcmp(argv[1], "-e") == 0 || strcmp(argv[1], "--erase") == 0)) {
         for (int i = 2; i < argc; i++) func_undefine(argv[i]);
         return 0;
@@ -2096,23 +2107,79 @@ static int b_emit(int argc, char **argv) {
     return 0;
 }
 
-/* key bindings: accepted so configs load; spire's own keys stay in effect */
-static strvec_t g_binds;
+/* bind [-M MODE] [-k] KEY ACTION...: fish key bindings. ACTION is a fish
+ * input function (forward-char, history-search-backward, ...) or any shell
+ * command, which can use `commandline` to read and change the line.
+ *   bind              list      bind -e KEY   erase      bind -f   functions
+ *   KEY: \cf \ef \e[A (old style) or ctrl-f alt-f up shift-tab (new style) */
 static int b_bind(int argc, char **argv) {
-    static bool init = false;
-    if (!init) { sv_init(&g_binds); init = true; }
-    if (argc == 1 || (argc == 2 && (strcmp(argv[1], "-a") == 0 || strcmp(argv[1], "--all") == 0))) {
-        for (size_t i = 0; i < g_binds.count; i++) printf("bind %s\n", g_binds.items[i]);
+    bool erase = false, terminfo = false, list_functions = false, list_keys = false, all = false;
+    const char *mode = "default";
+    int i = 1;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "--")) { i++; break; }
+        if ((!strcmp(a, "-M") || !strcmp(a, "--mode")) && i + 1 < argc) { mode = argv[++i]; continue; }
+        if ((!strcmp(a, "-m") || !strcmp(a, "--sets-mode")) && i + 1 < argc) { i++; continue; }
+        if (!strcmp(a, "-e") || !strcmp(a, "--erase")) erase = true;
+        else if (!strcmp(a, "-k") || !strcmp(a, "--key")) terminfo = true;
+        else if (!strcmp(a, "-f") || !strcmp(a, "--function-names")) list_functions = true;
+        else if (!strcmp(a, "-K") || !strcmp(a, "--key-names")) list_keys = true;
+        else if (!strcmp(a, "-a") || !strcmp(a, "--all")) all = true;
+        else if (!strcmp(a, "-L") || !strcmp(a, "--list-modes")) { printf("default\ninsert\n"); return 0; }
+        /* -s/--silent, --preset, --user: accepted */
+    }
+    if (list_functions) {
+        strvec_t f; sv_init(&f);
+        lineedit_list_functions(&f);
+        for (size_t k = 0; k < f.count; k++) printf("%s\n", f.items[k]);
+        sv_free(&f);
         return 0;
     }
-    if (strcmp(argv[1], "-L") == 0 || strcmp(argv[1], "--list-modes") == 0) { printf("default\n"); return 0; }
-    if (strcmp(argv[1], "-f") == 0 || strcmp(argv[1], "--function-names") == 0) return 0;
-    if (strcmp(argv[1], "-K") == 0 || strcmp(argv[1], "--key-names") == 0) return 0;
-    dstr_t d; ds_init(&d);
-    for (int i = 1; i < argc; i++) { if (i > 1) ds_append_c(&d, ' '); ds_append(&d, argv[i]); }
-    sv_push(&g_binds, xstrdup(d.data));
-    ds_free(&d);
-    return 0;
+    if (list_keys) {
+        printf("up\ndown\nleft\nright\nhome\nend\ntab\nshift-tab\nenter\nbackspace\ndelete\nescape\nspace\npageup\npagedown\nf1..f12\nctrl-X\nalt-X\n");
+        return 0;
+    }
+    /* vi modes other than insert/default aren't emulated */
+    bool mode_ok = !strcmp(mode, "default") || !strcmp(mode, "insert");
+    if (i >= argc) {
+        strvec_t b; sv_init(&b);
+        lineedit_list_binds(&b);
+        for (size_t k = 0; k < b.count; k++) printf("bind %s\n", b.items[k]);
+        sv_free(&b);
+        return 0;
+    }
+    if (erase && all) {
+        strvec_t b; sv_init(&b);
+        lineedit_list_binds(&b);
+        sv_free(&b);
+    }
+    int status = 0;
+    if (erase) {
+        for (; i < argc; i++) {
+            strvec_t seqs; sv_init(&seqs);
+            lineedit_key_seqs(argv[i], terminfo, &seqs);
+            for (size_t k = 0; k < seqs.count; k++) lineedit_unbind(seqs.items[k]);
+            sv_free(&seqs);
+        }
+        return 0;
+    }
+    const char *spec = argv[i++];
+    strvec_t seqs; sv_init(&seqs);
+    lineedit_key_seqs(spec, terminfo, &seqs);
+    if (seqs.count == 0) { sh_err("bind: %s: unknown key\n", spec); sv_free(&seqs); return 1; }
+    if (i >= argc) {
+        /* `bind KEY`: show it */
+        strvec_t b; sv_init(&b);
+        lineedit_list_binds(&b);
+        for (size_t k = 0; k < b.count; k++) if (!strncmp(b.items[k], spec, strlen(spec)) && b.items[k][strlen(spec)] == ' ') printf("bind %s\n", b.items[k]);
+        sv_free(&b);
+        sv_free(&seqs);
+        return 0;
+    }
+    if (mode_ok) for (size_t k = 0; k < seqs.count; k++) lineedit_bind(seqs.items[k], spec, argc - i, argv + i);
+    sv_free(&seqs);
+    return status;
 }
 
 /* commandline: the line being edited (for completions and bindings) */
@@ -2120,9 +2187,15 @@ static int b_commandline(int argc, char **argv) {
     const char *buf = lineedit_buffer();
     size_t cursor = lineedit_cursor();
     bool tokens = false, cut = false, current_token = false, cursor_q = false;
+    bool do_replace = false, do_insert = false, do_append = false, functions = false;
     int i = 1;
-    for (; i < argc && argv[i][0] == '-'; i++) {
+    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
         const char *a = argv[i];
+        if (!strcmp(a, "--")) { i++; break; }
+        if (!strcmp(a, "-r") || !strcmp(a, "--replace")) { do_replace = true; continue; }
+        if (!strcmp(a, "-i") || !strcmp(a, "--insert")) { do_insert = true; continue; }
+        if (!strcmp(a, "-a") || !strcmp(a, "--append")) { do_append = true; continue; }
+        if (!strcmp(a, "-f") || !strcmp(a, "--function")) { functions = true; continue; }
         if (a[1] == '-') {
             if (!strcmp(a, "--tokenize") || !strcmp(a, "--tokens-expanded") || !strcmp(a, "--tokens-raw")) tokens = true;
             else if (!strcmp(a, "--cut-at-cursor")) cut = true;
@@ -2137,8 +2210,35 @@ static int b_commandline(int argc, char **argv) {
             else if (*p == 'C') cursor_q = true;
         }
     }
+    if (functions) {
+        /* commandline -f FUNCTION...: run input functions as if their keys were pressed */
+        for (; i < argc; i++) {
+            char *one[] = { argv[i] };
+            (void)one;
+            lineedit_queue_function(argv[i]);
+        }
+        return 0;
+    }
+    if (cursor_q && i < argc) {
+        /* commandline -C N: move the cursor */
+        long pos = atol(argv[i]);
+        lineedit_set_cursor(pos < 0 ? 0 : (size_t)pos);
+        return 0;
+    }
     if (cursor_q) { printf("%zu\n", cursor); return 0; }
-    if (i < argc) return 0; /* setting the command line isn't supported */
+    if (i < argc) {
+        /* commandline [-r|-i|-a] [-t] TEXT: change the line */
+        if (!lineedit_active()) { sh_err("commandline: not editing a command line\n"); return 1; }
+        dstr_t t; ds_init(&t);
+        for (int k = i; k < argc; k++) { if (k > i) ds_append_c(&t, ' '); ds_append(&t, argv[k]); }
+        if (do_insert) lineedit_insert(t.data);
+        else if (do_append) lineedit_append(t.data);
+        else if (current_token) lineedit_replace_token(t.data);
+        else lineedit_replace(t.data);
+        (void)do_replace;
+        ds_free(&t);
+        return 0;
+    }
     size_t end = cut ? cursor : strlen(buf);
     char *text = xstrndup(buf, end);
     /* only the current command (after the last ; | & ) */
