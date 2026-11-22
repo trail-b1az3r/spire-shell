@@ -9,7 +9,7 @@ pass=0; fail=0
 for t in tests/*.sh tests/*.fish; do
     case "$t" in tests/run.sh|tests/run-compat.sh) continue ;; esac
     exp="${t%.*}.expected"
-    out="$(cd /tmp && HOME="$home" "$OLDPWD/spire" "$OLDPWD/$t" 2>&1)"
+    out="$(cd /tmp && HOME="$home" sh "$OLDPWD/spire" "$OLDPWD/$t" 2>&1)"
     if [ "$mode" = "--update" ]; then printf '%s\n' "$out" > "$exp"; continue; fi
     if [ "$out" = "$(cat "$exp")" ]; then
         printf '  \033[32mpass\033[0m %s\n' "$t"; pass=$((pass + 1))
