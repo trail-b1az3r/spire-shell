@@ -17,6 +17,9 @@ if [ -z "$ws" ]; then
         [ -x "$c" ] && ws="$c" && break
     done
 fi
+if [ -n "$ws" ] && [ "${ws#/*}" = "$ws" ]; then
+    ws="$here/$ws"
+fi
 if [ -z "$ws" ]; then
     echo "spire: Whetstone not found. Build it from https://github.com/trail-b1az3r/z-nd:" >&2
     echo "       cargo install --path crates/whetstone   (or set WHETSTONE=/path/to/whetstone)" >&2
