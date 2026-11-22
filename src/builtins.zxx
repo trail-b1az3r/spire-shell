@@ -606,7 +606,8 @@ fn builtin_string(argv) {
         return 2
     }
     let sub = argv[1]
-    var args = [a for a in argv[2:] if a != "--"]
+    var raw_args = argv[2:]
+    var args = [a for a in raw_args if a != "--"]
     var flags = [a for a in args if a.starts_with("-") and len(a) > 1]
     args = [a for a in args if not (a.starts_with("-") and len(a) > 1)]
     var piped = null
@@ -624,20 +625,20 @@ fn builtin_string(argv) {
         var length = null
         var values = []
         var i = 0
-        while i < len(args) {
-            let a = args[i]
-            if (a == "-s" or a == "--start") and i + 1 < len(args) {
-                start = int(args[i + 1])
+        while i < len(raw_args) {
+            let a = raw_args[i]
+            if (a == "-s" or a == "--start") and i + 1 < len(raw_args) {
+                start = int(raw_args[i + 1])
                 i += 2
                 continue
             }
-            if (a == "-e" or a == "--end") and i + 1 < len(args) {
-                end_pos = int(args[i + 1])
+            if (a == "-e" or a == "--end") and i + 1 < len(raw_args) {
+                end_pos = int(raw_args[i + 1])
                 i += 2
                 continue
             }
-            if (a == "-l" or a == "--length") and i + 1 < len(args) {
-                length = int(args[i + 1])
+            if (a == "-l" or a == "--length") and i + 1 < len(raw_args) {
+                length = int(raw_args[i + 1])
                 i += 2
                 continue
             }
@@ -647,8 +648,8 @@ fn builtin_string(argv) {
             }
             if a == "--" {
                 i += 1
-                while i < len(args) {
-                    values.push(args[i])
+                while i < len(raw_args) {
+                    values.push(raw_args[i])
                     i += 1
                 }
                 break
