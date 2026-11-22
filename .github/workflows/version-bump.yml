@@ -3,10 +3,8 @@ name: Spire version bump
 on:
   push:
     branches: ['z#nd']
-  paths-ignore:
-    - 'VERSION'
-  # Version commits carry [skip ci] and won't recursively run Actions.
-  # Note: paths-ignore applies only when every changed file matches.
+    paths-ignore:
+      - 'VERSION'
   workflow_dispatch:
     inputs:
       bump:
@@ -37,7 +35,7 @@ jobs:
       - name: Build Whetstone
         run: cargo build --release -p whetstone
         working-directory: z-nd
-      - name: Check and build Spire
+      - name: Check, compile, and test Spire
         env:
           WHETSTONE: ${{ github.workspace }}/z-nd/target/release/whetstone
         run: |
