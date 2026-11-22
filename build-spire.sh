@@ -45,6 +45,7 @@ echo "$next" > "$ROOT/build/VERSION"
 if [ "$install" -eq 1 ]; then
  if [ "$(id -u)" -ne 0 ]; then echo "Use sudo $0 --install" >&2; exit 1; fi
  install -d /usr/local/lib/spire-shell /usr/local/bin
+ install -m 755 "$WHETSTONE" /usr/local/bin/whetstone
  cp -R "$ROOT"/. /usr/local/lib/spire-shell/
  cat > /usr/local/bin/spire <<'LAUNCH'
 #!/usr/bin/env sh
