@@ -40,5 +40,5 @@ jobs:
         run: sh ./compile-spire.sh
       - name: Run regression suite
         env:
-          WHETSTONE: ../z-nd/target/release/whetstone
+          WHETSTONE: z-nd/target/release/whetstone
         run: sh ./tests/run.sh
