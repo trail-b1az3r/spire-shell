@@ -1,11 +1,15 @@
 #!/bin/sh
 # spire — the Zsharpend edition. Runs src/ through Whetstone.
-# Usage: ./spire [-c 'cmd' | script] [args...]
-#
-# Whetstone (with the `os` extender) comes from the Zsharpend repository,
-# https://github.com/trail-b1az3r/z-nd. It's looked up as $WHETSTONE, then
-# on $PATH, then in a z-nd checkout next to this one.
-here="$(cd "$(dirname "$0")" && pwd)"
+# Resolve symlinks first so the runtime project path is based on the real launcher.
+script_path="$0"
+while [ -L "$script_path" ]; do
+    link="$(readlink "$script_path")" || exit 1
+    case "$link" in
+        /*) script_path="$link" ;;
+        *) script_path="$(dirname "$script_path")/$link" ;;
+    esac
+done
+here="$(cd "$(dirname "$script_path")" && pwd)"
 ws="${WHETSTONE:-}"
 [ -n "$ws" ] || ws="$(command -v whetstone 2>/dev/null)"
 if [ -z "$ws" ]; then
