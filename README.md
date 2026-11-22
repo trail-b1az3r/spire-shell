@@ -63,3 +63,16 @@ and optionally runs it. This produces a `.wsb` bundle (not a standalone native b
 - **Redirection**: `>`, `>>`, `<`, `2>`, `2>>`, `&>`, `2>&1`, `>&2`, `<<<`, here-documents (`<<EOF`, `<<-EOF`, `<<'EOF'`), on commands and on blocks; `( subshells )`, process substitution `<(cmd)` / `>(cmd)`, `select`.
 - **Pipelines** run all their stages at once through real pipes, builtins and functions included; a trailing builtin runs in the shell, so `… | read x` and `… | source` keep their effect.
 - **Builtins**: `cd pwd echo printf set` (fish, and bash's `-e/-x/-u/-o pipefail/--`) `export unset local shift alias abbr source read type history functions status set_color ls ll la count contains string math test [ trap getopts complete commandline jobs fg return exit break continue emit fish_add_path prompt_pwd fish_vcs_prompt bind command builtin eval isatty help true false`. `trap` handles `EXIT`, `ERR` and signals; `printf` does widths, precision, `%b`, `%q`, `-v`.
+
+
+## Versioned builds and system install
+
+Spire tracks semantic versions in `VERSION`. Use `sh ./build-spire.sh` for a normal build; it automatically increments the patch version (for example, `0.1.0` to `0.1.1`). Select a manual major bump with `--major` (resets minor and patch) or manual minor bump with `--minor` (resets patch). Explicit `--patch` is also available.
+
+- `sh ./build-spire.sh --major`: manual major increment
+- `sh ./build-spire.sh --minor`: manual minor increment
+- `sh ./build-spire.sh --patch`: automatic patch increment
+- `sh ./build-spire.sh --install`: build, then install Spire and Whetstone to `/usr/local` (run with sudo)
+- `sh ./build-spire.sh --run`: build and run the resulting bundle
+
+After system installation, upgrade the installation and rebuild from the latest `z#nd` branch with `sudo spire-upgrade`. The upgrade script installs the Whetstone runtime alongside Spire, so the installed launcher is self-contained with respect to the runtime dependency.
