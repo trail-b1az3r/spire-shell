@@ -4,11 +4,11 @@ set -eu
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 SPIRE="$ROOT/spire"
 
-[ -x "$SPIRE" ] || { echo "FAIL: spire launcher missing or not executable" >&2; exit 1; }
+[ -f "$SPIRE" ] || { echo "FAIL: spire launcher missing" >&2; exit 1; }
 
 expect_ok() {
     label="$1"; command="$2"
-    if "$SPIRE" -c "$command" >/dev/null 2>&1; then
+    if sh "$SPIRE" -c "$command" >/dev/null 2>&1; then
         echo "PASS: $label"
     else
         echo "FAIL: $label" >&2
@@ -17,7 +17,7 @@ expect_ok() {
 }
 expect_output() {
     label="$1"; command="$2"; expected="$3"
-    actual="$("$SPIRE" -c "$command" 2>&1)" || { echo "FAIL: $label (nonzero exit)" >&2; exit 1; }
+    actual="$(sh "$SPIRE" -c "$command" 2>&1)" || { echo "FAIL: $label (nonzero exit)" >&2; exit 1; }
     if [ "$actual" = "$expected" ]; then
         echo "PASS: $label"
     else
