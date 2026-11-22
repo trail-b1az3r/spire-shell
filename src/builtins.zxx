@@ -1449,6 +1449,42 @@ fn builtin_local(argv) {
     return 0
 }
 
+
+// Fish-style random integer, inclusive. Use the runtime clock as a seed source.
+fn builtin_random(argv) {
+    var lo = 0
+    var hi = 32767
+    if len(argv) > 1 {
+        try {
+            lo = int(argv[1])
+        } catch e {
+            err("random: invalid minimum: ${argv[1]}")
+            return 2
+        }
+    }
+    if len(argv) > 2 {
+        try {
+            hi = int(argv[2])
+        } catch e {
+            err("random: invalid maximum: ${argv[2]}")
+            return 2
+        }
+    }
+    if hi < lo {
+        err("random: maximum must be greater than or equal to minimum")
+        return 2
+    }
+    let span = hi - lo + 1
+    if span <= 0 {
+        err("random: range is too large")
+        return 2
+    }
+    // Mix clock ticks with process ID to avoid a fixed value between rapid calls.
+    let seed = (os.time_ms() * 1103515245 + os.pid() * 12345 + 12345) % 2147483647
+    outl(str(lo + (seed % span)))
+    return 0
+}
+
 fn builtin_true(argv) {
     return 0
 }
@@ -1497,6 +1533,7 @@ const BUILTINS = {
     "fish_vcs_prompt": builtin_fish_vcs_prompt,
     "fish_git_prompt": builtin_fish_vcs_prompt,
     "help": builtin_help,
+    "random": builtin_random,
     "true": builtin_true,
     "false": builtin_false,
     "pwd": builtin_pwd,
