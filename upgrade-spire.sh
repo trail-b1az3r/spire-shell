@@ -20,6 +20,7 @@ echo "Building Spire bundle..."
 sh "$TMP/spire/compile-spire.sh"
 version="$(cat "$TMP/spire/VERSION" 2>/dev/null || echo unknown)"
 install -d /usr/local/lib/spire-shell /usr/local/bin
+install -m 755 "$WHETSTONE" /usr/local/bin/whetstone
 cp -R "$TMP/spire"/. /usr/local/lib/spire-shell/
 cat > /usr/local/bin/spire <<'LAUNCH'
 #!/usr/bin/env sh
