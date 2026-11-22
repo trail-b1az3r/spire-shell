@@ -617,6 +617,69 @@ fn builtin_string(argv) {
         args = [l for l in piped.split("\n") if l != ""]
     }
     let quiet = "-q" in flags or "--quiet" in flags
+    if sub == "sub" {
+        // fish-compatible substring: positions are 1-based, end is inclusive.
+        var start = 1
+        var end_pos = null
+        var length = null
+        var values = []
+        var i = 0
+        while i < len(args) {
+            let a = args[i]
+            if (a == "-s" or a == "--start") and i + 1 < len(args) {
+                start = int(args[i + 1])
+                i += 2
+                continue
+            }
+            if (a == "-e" or a == "--end") and i + 1 < len(args) {
+                end_pos = int(args[i + 1])
+                i += 2
+                continue
+            }
+            if (a == "-l" or a == "--length") and i + 1 < len(args) {
+                length = int(args[i + 1])
+                i += 2
+                continue
+            }
+            if a == "-q" or a == "--quiet" {
+                i += 1
+                continue
+            }
+            if a == "--" {
+                i += 1
+                while i < len(args) {
+                    values.push(args[i])
+                    i += 1
+                }
+                break
+            }
+            values.push(a)
+            i += 1
+        }
+        if len(values) == 0 {
+            let input = stdin_text()
+            if input != null {
+                values = [l for l in input.split("\\n") if l != ""]
+            }
+        }
+        for value in values {
+            let n = len(value)
+            var first = start > 0 ? start - 1 : max(0, n + start)
+            first = min(first, n)
+            var last = n
+            if end_pos != null {
+                last = end_pos > 0 ? end_pos : max(0, n + end_pos + 1)
+                last = min(max(last, 0), n)
+            } elif length != null {
+                last = min(n, max(first, first + max(0, length)))
+            }
+            if end_pos != null and length != null {
+                last = min(last, first + max(0, length))
+            }
+            outl(value[first:max(first, last)])
+        }
+        return len(values) > 0 ? 0 : 1
+    }
     if sub == "upper" or sub == "lower" {
         for a in args {
             outl(sub == "upper" ? a.upper() : a.lower())
