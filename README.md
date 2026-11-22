@@ -63,3 +63,27 @@ and optionally runs it. This produces a `.wsb` bundle (not a standalone native b
 - **Redirection**: `>`, `>>`, `<`, `2>`, `2>>`, `&>`, `2>&1`, `>&2`, `<<<`, here-documents (`<<EOF`, `<<-EOF`, `<<'EOF'`), on commands and on blocks; `( subshells )`, process substitution `<(cmd)` / `>(cmd)`, `select`.
 - **Pipelines** run all their stages at once through real pipes, builtins and functions included; a trailing builtin runs in the shell, so `… | read x` and `… | source` keep their effect.
 - **Builtins**: `cd pwd echo printf set` (fish, and bash's `-e/-x/-u/-o pipefail/--`) `export unset local shift alias abbr source read type history functions status set_color ls ll la count contains string math test [ trap getopts complete commandline jobs fg return exit break continue emit fish_add_path prompt_pwd fish_vcs_prompt bind command builtin eval isatty help true false`. `trap` handles `EXIT`, `ERR` and signals; `printf` does widths, precision, `%b`, `%q`, `-v`.
+
+
+## Versioned builds and system install
+
+Versions are managed by **GitHub Actions**, not by running a local build script.
+
+- Every successful push to `z#nd` runs the validation build/tests, then automatically bumps the patch version in `VERSION`.
+- Go to **Actions → Spire version bump → Run workflow** to manually select **major**, **minor**, or **patch**. The workflow validates/builds/tests first, then commits the chosen version bump to `z#nd`.
+- Major increments reset minor and patch to 0; minor increments reset patch to 0.
+- Version-only commits are excluded from automatic push triggers, preventing bump loops.
+
+Local build/install script does not modify `VERSION`:
+
+```sh
+sh ./build-spire.sh
+sh ./build-spire.sh --run
+sudo sh ./build-spire.sh --install
+```
+
+After system installation, update the system build using:
+
+```sh
+sudo spire-upgrade
+```

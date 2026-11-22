@@ -3,6 +3,12 @@
 var ABBRS = {}
 var HISTORY = []
 var LS_OPTS = null       // the color/indicator flags this system's ls accepts
+var PSUB_FILES = {}
+
+fn builtin_enable_transience(argv) {
+    // Fish compatibility: transient prompts are unsupported; succeed quietly.
+    return 0
+}
 
 fn builtin_cd(argv) {
     var target = len(argv) > 1 ? argv[1] : os.home()
@@ -292,7 +298,34 @@ fn builtin_source(argv) {
     var_set("argv", argv[2:])
     let st = run_source(text, argv[1])
     var_set("argv", saved ?? [])
+    cleanup_psub(argv[1])
     return st
+}
+
+fn builtin_psub(argv) {
+    // Write piped stdin to a temporary fish script and print its path.
+    let content = stdin_text() ?? ""
+    let path = "/tmp/spire-psub-" + str(os.pid()) + "-" + str(os.time_ms()) + ".fish"
+    if not os.write_file(path, content) {
+        err("psub: unable to write temporary script")
+        return 1
+    }
+    PSUB_FILES[path] = true
+    outl(path)
+    return 0
+}
+
+fn cleanup_psub(path) {
+    if path in PSUB_FILES {
+        os.run([["rm", "-f", path]], {capture: true, stderr: "/dev/null"})
+        remove(PSUB_FILES, path)
+    }
+}
+
+fn cleanup_all_psub() {
+    for path in keys(PSUB_FILES) {
+        cleanup_psub(path)
+    }
 }
 
 fn builtin_read(argv) {
@@ -1054,6 +1087,7 @@ fn run_pending_traps() {
 
 fn shell_exit(code) {
     run_trap("EXIT")
+    cleanup_all_psub()
     raw_mode(false)
     os.exit(code)
 }
@@ -1365,6 +1399,8 @@ fn builtin_pwd(argv) {
 }
 
 const BUILTINS = {
+    "psub": builtin_psub,
+    "enable_transience": builtin_enable_transience,
     "cd": builtin_cd,
     "echo": builtin_echo,
     "set": builtin_set,

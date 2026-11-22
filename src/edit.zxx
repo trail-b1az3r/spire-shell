@@ -7,6 +7,7 @@ var CMD_CACHE_PATH = ""
 fn raw_mode(enable) {
     if enable != RAW and os.isatty(0) {
         os.raw(enable)
+        os.write(enable ? "\e[?2004h" : "\e[?2004l")
         RAW = enable
     }
 }
@@ -365,40 +366,60 @@ fn suggestion(st) {
     return ""
 }
 
+// Return [visual rows, column] for rendered text, respecting newlines and wraps.
+fn screen_pos(s, W) {
+    let plain = strip_ansi(s)
+    var row = 0
+    var col = 0
+    let lines = plain.split("\n")
+    for i in 0..len(lines) {
+        let width = os.width(lines[i])
+        row += width / W
+        col = width % W
+        if i < len(lines) - 1 {
+            row += 1
+            col = 0
+        }
+    }
+    return [row, col]
+}
+
 fn redraw(st, final = false) {
-    let W = os.term_size()[0]
+    let W = max(1, os.term_size()[0])
     var o = "\e[?25l"
     if st.row > 0 {
         o = o + "\e[${st.row}A"
     }
-    o = o + "\r" + st.ptail + highlight(st.buf)
-    let pw = os.width(st.ptail)
-    var total = pw + os.width(st.buf)
+    let display = st.ptail + highlight(st.buf)
+    o = o + "\r" + display.replace("\n", "\r\n")
+    var total_text = st.ptail + st.buf
     let sugg = final ? "" : suggestion(st)
     if sugg != "" {
-        o = o + C_SUGGEST + sugg + RESET
-        total += os.width(sugg)
+        o = o + C_SUGGEST + sugg.replace("\n", "\r\n") + RESET
+        total_text = total_text + sugg
     }
+    let end_pos = screen_pos(total_text, W)
+    let end_row = end_pos[0]
+    let end_col = end_pos[1]
     var rp = false
-    let rw = os.width(st.right)
-    if st.right != "" and rw > 0 and total + rw + 2 <= W {
+    let rw = os.width(strip_ansi(st.right))
+    if st.right != "" and rw > 0 and end_row == 0 and end_col + rw + 2 <= W {
         o = o + "\e[K\e[${W - rw}G" + st.right + RESET
         rp = true
     }
-    if not rp and total > 0 and total % W == 0 {
+    if not rp and end_row == 0 and end_col == 0 and total_text != "" {
         o = o + " \b"
     }
     o = o + "\e[J"
-    let end_row = rp ? 0 : total / W
     var menu_lines = 0
     if st.menu != null and not final {
         let m = render_menu(st, W)
         o = o + "\r\n" + m.text
         menu_lines = m.lines
     }
-    let cur_cols = final ? total : pw + os.width(st.buf[:st.cur])
-    let trow = cur_cols / W
-    let tcol = cur_cols % W
+    let cursor_pos = screen_pos(st.ptail + st.buf[:st.cur], W)
+    let trow = cursor_pos[0]
+    let tcol = cursor_pos[1]
     let now_row = end_row + menu_lines
     if now_row > trow {
         o = o + "\e[${now_row - trow}A"
@@ -408,10 +429,9 @@ fn redraw(st, final = false) {
         o = o + "\e[${tcol}C"
     }
     o = o + "\e[?25h"
-    st.row = trow
+    st.row = end_row
     os.write(o)
 }
-
 fn insert(st, text) {
     st.buf = st.buf[:st.cur] + text + st.buf[st.cur:]
     st.cur += len(text)
@@ -531,7 +551,10 @@ fn read_line_interactive(left, right, animate) {
                 continue
             }
         }
-        if k == "\r" or k == "\n" {
+        if k.starts_with("\e[200~") and k.ends_with("\e[201~") {
+            let pasted = k[6:-6]
+            insert(st, pasted)
+        } elif k == "\r" or k == "\n" {
             expand_abbr(st)
             st.cur = len(st.buf)
             redraw(st, true)
