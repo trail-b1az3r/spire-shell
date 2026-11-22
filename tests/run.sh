@@ -1,4 +1,5 @@
 #!/bin/sh
+mode="${1:-}"
 # Runs every tests/NAME.sh and NAME.fish through ./spire and compares the
 # output with NAME.expected.  tests/run.sh --update rewrites the expected files.
 cd "$(dirname "$0")/.." || exit 2
@@ -6,7 +7,7 @@ home="$(mktemp -d)"
 trap 'rm -rf "$home"' EXIT
 pass=0; fail=0
 for t in tests/*.sh tests/*.fish; do
-    case "$t" in tests/run.sh) continue ;; esac
+    case "$t" in tests/run.sh|tests/run-compat.sh) continue ;; esac
     exp="${t%.*}.expected"
     out="$(cd /tmp && HOME="$home" "$OLDPWD/spire" "$OLDPWD/$t" 2>&1)"
     if [ "$mode" = "--update" ]; then printf '%s\n' "$out" > "$exp"; continue; fi
