@@ -2,9 +2,12 @@ name: Spire version bump
 
 on:
   push:
-    branches: ['z#nd']
+    branches:
+      - 'z#nd'
+    # NOTE: paths-ignore belongs beside branches, not inside branches.
     paths-ignore:
       - 'VERSION'
+
   workflow_dispatch:
     inputs:
       bump:
