@@ -19,6 +19,6 @@ for t in tests/*.sh tests/*.fish; do
     fi
 done
 [ "$mode" = "--update" ] && exit 0
-if [ "$fail" -eq 0 ] && [ -x tests/run-compat.sh ]; then tests/run-compat.sh || fail=$((fail + 1)); fi
+if [ "$fail" -eq 0 ]; then sh tests/run-compat.sh || fail=$((fail + 1)); fi
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
