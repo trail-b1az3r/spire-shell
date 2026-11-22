@@ -1,0 +1,80 @@
+name: Spire version bump
+
+on:
+  push:
+    branches: ['z#nd']
+  paths-ignore:
+    - 'VERSION'
+  # Version commits carry [skip ci] and won't recursively run Actions.
+  # Note: paths-ignore applies only when every changed file matches.
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version increment type
+        required: true
+        type: choice
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout Whetstone
+        uses: actions/checkout@v4
+        with:
+          repository: trail-b1az3r/z-nd
+          ref: claude/spire-in-zsharpend
+          path: z-nd
+      - name: Build Whetstone
+        run: cargo build --release -p whetstone
+        working-directory: z-nd
+      - name: Check and build Spire
+        env:
+          WHETSTONE: ${{ github.workspace }}/z-nd/target/release/whetstone
+        run: |
+          "$WHETSTONE" check .
+          sh ./compile-spire.sh
+          sh ./tests/run.sh
+
+  bump:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: z#nd
+      - name: Calculate version
+        id: version
+        shell: bash
+        env:
+          BUMP: ${{ github.event.inputs.bump || 'patch' }}
+        run: |
+          set -euo pipefail
+          version="$(cat VERSION)"
+          IFS='.' read -r major minor patch <<< "$version"
+          [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ && "$patch" =~ ^[0-9]+$ ]] || { echo "Invalid VERSION: $version"; exit 1; }
+          case "$BUMP" in
+            major) major=$((major+1)); minor=0; patch=0 ;;
+            minor) minor=$((minor+1)); patch=0 ;;
+            patch) patch=$((patch+1)) ;;
+            *) echo "Invalid bump type: $BUMP"; exit 1 ;;
+          esac
+          next="$major.$minor.$patch"
+          echo "$next" > VERSION
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add VERSION
+          git commit -m "chore: bump Spire version to ${{ steps.version.outputs.version }} [skip ci]"
+          git push origin HEAD:z#nd
