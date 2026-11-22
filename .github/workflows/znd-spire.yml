@@ -28,7 +28,8 @@ jobs:
         working-directory: z-nd
       - name: Verify shell scripts
         run: |
-          sh -n spire compile-spire.sh tests/run.sh tests/run-compat.sh
+          sh -n spire compile-spire.sh tests/run.sh tests/run-compat.sh tools/test-launcher-symlink.sh
+          sh tools/test-launcher-symlink.sh
       - name: Check Z# Spire source
         env:
           WHETSTONE: z-nd/target/release/whetstone
