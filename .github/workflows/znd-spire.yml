@@ -22,16 +22,16 @@ jobs:
         with:
           repository: trail-b1az3r/z-nd
           ref: claude/spire-in-zsharpend
-          path: ../z-nd
+          path: z-nd
       - name: Build Whetstone
         run: cargo build --release -p whetstone
-        working-directory: ../z-nd
+        working-directory: z-nd
       - name: Verify shell scripts
         run: |
           sh -n spire compile-spire.sh tests/run.sh tests/run-compat.sh
       - name: Check Z# Spire source
         env:
-          WHETSTONE: ../z-nd/target/release/whetstone
+          WHETSTONE: z-nd/target/release/whetstone
         run: $WHETSTONE check .
       - name: Build Spire bundle
         env:
