@@ -69,7 +69,9 @@ jobs:
 
           # The regressions reported from a real terminal session.
           run_case "test numeric equality" 'test 4 -eq 4 && echo test-ok' 'test-ok'
-          run_case "string substring" 'string sub -s 2 -l 3 abcdef' 'bcd'
+          run_case "string substring start+length" 'string sub -s 2 -l 3 abcdef' 'bcd'
+          run_case "string substring end" 'string sub -s 2 -e 4 abcdef' 'bcd'
+          run_case "string substring negative start" 'string sub -s -3 abcdef' 'def'
 
           # random is inherently variable: validate numeric output and bounds.
           value="$(sh ./spire -c 'random 1 4' 2>&1)" || {
