@@ -7,6 +7,7 @@ var CMD_CACHE_PATH = ""
 fn raw_mode(enable) {
     if enable != RAW and os.isatty(0) {
         os.raw(enable)
+        os.write(enable ? "\\e[?2004h" : "\\e[?2004l")
         RAW = enable
     }
 }
@@ -531,7 +532,10 @@ fn read_line_interactive(left, right, animate) {
                 continue
             }
         }
-        if k == "\r" or k == "\n" {
+        if k.starts_with("\\e[200~") and k.ends_with("\\e[201~") {
+            let pasted = k[6:-6]
+            insert(st, pasted)
+        } elif k == "\r" or k == "\n" {
             expand_abbr(st)
             st.cur = len(st.buf)
             redraw(st, true)
