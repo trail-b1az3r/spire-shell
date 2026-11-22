@@ -9,7 +9,7 @@ for t in tests/*.sh tests/*.fish; do
     case "$t" in tests/run.sh) continue ;; esac
     exp="${t%.*}.expected"
     out="$(cd /tmp && HOME="$home" "$OLDPWD/spire" "$OLDPWD/$t" 2>&1)"
-    if [ "$1" = "--update" ]; then printf '%s\n' "$out" > "$exp"; continue; fi
+    if [ "$mode" = "--update" ]; then printf '%s\n' "$out" > "$exp"; continue; fi
     if [ "$out" = "$(cat "$exp")" ]; then
         printf '  \033[32mpass\033[0m %s\n' "$t"; pass=$((pass + 1))
     else
@@ -17,6 +17,7 @@ for t in tests/*.sh tests/*.fish; do
         printf '%s\n' "$out" | diff "$exp" - | sed 's/^/      /'
     fi
 done
-[ "$1" = "--update" ] && exit 0
+[ "$mode" = "--update" ] && exit 0
+if [ "$fail" -eq 0 ] && [ -x tests/run-compat.sh ]; then tests/run-compat.sh || fail=$((fail + 1)); fi
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
