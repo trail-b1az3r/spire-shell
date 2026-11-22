@@ -1,24 +1,30 @@
 #!/usr/bin/env sh
-# Regression checks for shell compatibility builtins and Z# project build.
+# Compatibility smoke tests. Requires a built/working Whetstone runtime.
 set -eu
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 SPIRE="$ROOT/spire"
 
-if [ ! -x "$SPIRE" ]; then
-  echo "test-compat: spire launcher is not executable: $SPIRE" >&2
-  exit 1
-fi
+[ -x "$SPIRE" ] || { echo "FAIL: spire launcher missing or not executable" >&2; exit 1; }
 
-run_ok() {
-  label="$1"; shift
-  if "$SPIRE" -c "$*" >/dev/null 2>&1; then
-    echo "PASS: $label"
-  else
-    echo "FAIL: $label" >&2
-    exit 1
-  fi
+expect_ok() {
+    label="$1"; command="$2"
+    if "$SPIRE" -c "$command" >/dev/null 2>&1; then
+        echo "PASS: $label"
+    else
+        echo "FAIL: $label" >&2
+        exit 1
+    fi
 }
-
-run_ok "enable_transience is accepted" "enable_transience"
-
-echo "Compatibility builtin checks passed."
+expect_output() {
+    label="$1"; command="$2"; expected="$3"
+    actual="$("$SPIRE" -c "$command" 2>&1)" || { echo "FAIL: $label (nonzero exit)" >&2; exit 1; }
+    if [ "$actual" = "$expected" ]; then
+        echo "PASS: $label"
+    else
+        echo "FAIL: $label (expected '$expected', got '$actual')" >&2
+        exit 1
+    fi
+}
+expect_ok "enable_transience compatibility builtin" "enable_transience"
+expect_output "echo output" "echo spire-compat-ok" "spire-compat-ok"
+echo "Compatibility smoke tests passed."
