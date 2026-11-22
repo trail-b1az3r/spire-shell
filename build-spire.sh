@@ -49,12 +49,20 @@ if [ -z "${WHETSTONE:-}" ]; then
     [ -x "$candidate" ] && WHETSTONE="$candidate" && break
   done
 fi
+if [ -z "${WHETSTONE:-}" ] || [ ! -x "$WHETSTONE" ]; then
+  if [ -d "$ROOT/../z-nd" ]; then
+    unset WHETSTONE
+  else
+    echo "build-spire: Whetstone not found and neighboring z-nd checkout is missing" >&2
+    echo "Install Whetstone or clone trail-b1az3r/z-nd next to this repository." >&2
+    exit 127
+  fi
+fi
+sh "$ROOT/compile-spire.sh" --build-whetstone
 if [ -z "${WHETSTONE:-}" ]; then
-  echo "build-spire: no Whetstone executable found; compile will try building adjacent z-nd" >&2
   WHETSTONE="$ROOT/../z-nd/target/release/whetstone"
 fi
 export WHETSTONE
-sh "$ROOT/compile-spire.sh" --build-whetstone
 echo "$next" > "$ROOT/build/VERSION"
 if [ "$install" -eq 1 ]; then
  if [ "$(id -u)" -ne 0 ]; then echo "Use sudo $0 --install" >&2; exit 1; fi
