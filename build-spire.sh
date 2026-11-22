@@ -38,7 +38,6 @@ case "$bump" in
  patch) patch=$((patch + 1)) ;;
 esac
 next="$major.$minor.$patch"
-printf '%s\n' "$next" > "$VERSION_FILE"
 echo "Spire version: $current -> $next ($bump bump)"
 # Resolve the runtime so --install can copy it even if compile-spire built it.
 if [ -z "${WHETSTONE:-}" ]; then
@@ -59,6 +58,8 @@ if [ -z "${WHETSTONE:-}" ] || [ ! -x "$WHETSTONE" ]; then
   fi
 fi
 sh "$ROOT/compile-spire.sh" --build-whetstone
+# Persist version only after compilation succeeds.
+printf '%s\n' "$next" > "$VERSION_FILE"
 if [ -z "${WHETSTONE:-}" ]; then
   WHETSTONE="$ROOT/../z-nd/target/release/whetstone"
 fi
