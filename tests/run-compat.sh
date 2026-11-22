@@ -27,4 +27,5 @@ expect_output() {
 }
 expect_ok "enable_transience compatibility builtin" "enable_transience"
 expect_output "echo output" "echo spire-compat-ok" "spire-compat-ok"
+expect_output "psub source pipeline" "source (echo \"echo psub-compat-ok\" | psub)" "psub-compat-ok"
 echo "Compatibility smoke tests passed."
