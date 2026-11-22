@@ -40,6 +40,20 @@ esac
 next="$major.$minor.$patch"
 printf '%s\n' "$next" > "$VERSION_FILE"
 echo "Spire version: $current -> $next ($bump bump)"
+# Resolve the runtime so --install can copy it even if compile-spire built it.
+if [ -z "${WHETSTONE:-}" ]; then
+  WHETSTONE="$(command -v whetstone 2>/dev/null || true)"
+fi
+if [ -z "${WHETSTONE:-}" ]; then
+  for candidate in "$ROOT/../z-nd/target/release/whetstone" "$ROOT/../z-nd/target/debug/whetstone"; do
+    [ -x "$candidate" ] && WHETSTONE="$candidate" && break
+  done
+fi
+if [ -z "${WHETSTONE:-}" ]; then
+  echo "build-spire: no Whetstone executable found; compile will try building adjacent z-nd" >&2
+  WHETSTONE="$ROOT/../z-nd/target/release/whetstone"
+fi
+export WHETSTONE
 sh "$ROOT/compile-spire.sh" --build-whetstone
 echo "$next" > "$ROOT/build/VERSION"
 if [ "$install" -eq 1 ]; then
