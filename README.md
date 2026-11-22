@@ -67,12 +67,23 @@ and optionally runs it. This produces a `.wsb` bundle (not a standalone native b
 
 ## Versioned builds and system install
 
-Spire tracks semantic versions in `VERSION`. Use `sh ./build-spire.sh` for a normal build; it automatically increments the patch version (for example, `0.1.0` to `0.1.1`). Select a manual major bump with `--major` (resets minor and patch) or manual minor bump with `--minor` (resets patch). Explicit `--patch` is also available.
+Versions are managed by **GitHub Actions**, not by running a local build script.
 
-- `sh ./build-spire.sh --major`: manual major increment
-- `sh ./build-spire.sh --minor`: manual minor increment
-- `sh ./build-spire.sh --patch`: automatic patch increment
-- `sh ./build-spire.sh --install`: build, then install Spire and Whetstone to `/usr/local` (run with sudo)
-- `sh ./build-spire.sh --run`: build and run the resulting bundle
+- Every successful push to `z#nd` runs the validation build/tests, then automatically bumps the patch version in `VERSION`.
+- Go to **Actions → Spire version bump → Run workflow** to manually select **major**, **minor**, or **patch**. The workflow validates/builds/tests first, then commits the chosen version bump to `z#nd`.
+- Major increments reset minor and patch to 0; minor increments reset patch to 0.
+- Version-only commits are excluded from automatic push triggers, preventing bump loops.
 
-After system installation, upgrade the installation and rebuild from the latest `z#nd` branch with `sudo spire-upgrade`. The upgrade script installs the Whetstone runtime alongside Spire, so the installed launcher is self-contained with respect to the runtime dependency.
+Local build/install script does not modify `VERSION`:
+
+```sh
+sh ./build-spire.sh
+sh ./build-spire.sh --run
+sudo sh ./build-spire.sh --install
+```
+
+After system installation, update the system build using:
+
+```sh
+sudo spire-upgrade
+```
