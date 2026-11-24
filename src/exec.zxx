@@ -82,6 +82,21 @@ fn run_capture(src) {
 }
 
 fn run_source(src, path = "") {
+    if len(SCOPES) == 0 and len(OUTBUF) == 0 and CALL_DEPTH == 0 {
+        // the outermost level: nothing may escape from here
+        try {
+            return run_source_inner(src, path)
+        } catch e {
+            recover_state()
+            err("internal error: ${e}")
+            STATUS = 1
+            return 1
+        }
+    }
+    return run_source_inner(src, path)
+}
+
+fn run_source_inner(src, path) {
     let r = parse_program(src)
     if r.status == "error" {
         err((path == "" ? "" : path + ": ") + r.err)
@@ -531,7 +546,7 @@ fn run_argv(argv, redirs, err_to_pipe = false) {
         return with_redirs_inproc(redirs, || call_function(FUNCS[name], argv))
     }
     if name in BUILTINS {
-        return with_redirs_inproc(redirs, || BUILTINS[name](argv))
+        return with_redirs_inproc(redirs, || guarded_builtin(name, argv))
     }
     if name.index_of("/") < 0 and os.which(name) == null {
         if try_autoload(name) {
@@ -543,6 +558,40 @@ fn run_argv(argv, redirs, err_to_pipe = false) {
         return with_redirs_inproc(redirs, || not_found(name))
     }
     return run_external([argv], redirs, err_to_pipe)
+}
+
+// a builtin hitting an unexpected value reports it and fails, instead of
+// the error escaping and taking the whole shell down
+fn guarded_builtin(name, argv) {
+    let depth_out = len(OUTBUF)
+    let depth_in = len(INPUT)
+    try {
+        return BUILTINS[name](argv)
+    } catch e {
+        while len(OUTBUF) > depth_out {
+            out(OUTBUF.pop())
+        }
+        while len(INPUT) > depth_in {
+            INPUT.pop()
+        }
+        err("${name}: ${e}")
+        return 1
+    }
+}
+
+// after an error escapes a whole command line: put the shell's state back
+// so the next command runs normally
+fn recover_state() {
+    OUTBUF = []
+    INPUT = []
+    SCOPES = []
+    CALL_DEPTH = 0
+    COND_DEPTH = 0
+    QUIET_ERRS = 0
+    FLAGS.brk = false
+    FLAGS.cont = false
+    FLAGS.ret = false
+    raw_mode(false)
 }
 
 fn is_dir(p) {

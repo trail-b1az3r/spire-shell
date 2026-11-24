@@ -680,15 +680,27 @@ fn builtin_fg(argv) {
     return r.status
 }
 
+// a number argument, or null (after an error) if it isn't one
+fn num_arg(cmd, text) {
+    try {
+        return parse_int(text.trim())
+    } catch e {
+        err("${cmd}: ${text}: numeric argument required")
+        return null
+    }
+}
+
 fn builtin_return(argv) {
+    let n = len(argv) > 1 ? num_arg("return", argv[1]) : STATUS
     FLAGS.ret = true
-    FLAGS.code = len(argv) > 1 ? int(argv[1]) : STATUS
+    FLAGS.code = n ?? 2
     return FLAGS.code
 }
 
 fn builtin_exit(argv) {
+    let n = len(argv) > 1 ? num_arg("exit", argv[1]) : STATUS
     FLAGS.exit = true
-    FLAGS.code = len(argv) > 1 ? int(argv[1]) : STATUS
+    FLAGS.code = n ?? 2
     return FLAGS.code
 }
 
@@ -1329,7 +1341,10 @@ fn builtin_getopts(argv) {
 }
 
 fn builtin_shift(argv) {
-    let n = len(argv) > 1 ? int(argv[1]) : 1
+    let n = len(argv) > 1 ? num_arg("shift", argv[1]) : 1
+    if n == null {
+        return 2
+    }
     let a = var_lookup("argv") ?? []
     if n > len(a) {
         return 1

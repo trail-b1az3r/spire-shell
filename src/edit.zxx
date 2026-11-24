@@ -541,6 +541,20 @@ fn read_line_interactive(left, right, animate) {
             return st.buf
         }
         if k == ctrl("c") {
+            // a burst of Ctrl-C (key repeat, or presses while a command was
+            // being interrupted) counts once; a real key after it is kept
+            while len(KEYQ) == 0 and os.key_waiting(0) {
+                let nk = os.read_key()
+                if nk != ctrl("c") {
+                    KEYQ.push(nk)
+                    break
+                }
+            }
+            if st.buf == "" and st.menu == null {
+                st.hist = 0
+                redraw(st)
+                continue
+            }
             st.cur = len(st.buf)
             redraw(st, true)
             os.write("\e[90m^C\e[0m\r\n")

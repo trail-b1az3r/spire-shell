@@ -145,7 +145,13 @@ fn repl() {
         }
         emit_event("event:fish_preexec")
         let t0 = os.time_ms()
-        run_node(r.node)
+        try {
+            run_node(r.node)
+        } catch e {
+            recover_state()
+            err("internal error: ${e}")
+            STATUS = 1
+        }
         var_set("CMD_DURATION", [str(os.time_ms() - t0)], "global")
         FLAGS.brk = false
         FLAGS.cont = false
