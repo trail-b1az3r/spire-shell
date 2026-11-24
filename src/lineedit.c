@@ -1282,6 +1282,20 @@ char *lineedit_read(const char *prompt_fmt) {
 
         switch (c) {
             case 3: /* Ctrl-C: cancel line */
+                /* holding Ctrl-C (key repeat), or Ctrl-Cs typed while a
+                 * command was being interrupted, arrive as a burst: one is
+                 * enough, so drop the rest of the burst */
+                while (!g_rawq_len && !g_pushq_len && input_pending()) {
+                    unsigned char next;
+                    if (read(STDIN_FILENO, &next, 1) != 1) break;
+                    if (next != 3) { queue_push(&next, 1); break; } /* a real key: keep it */
+                }
+                if (s.buf.len == 0 && !s.menu) {
+                    /* nothing to cancel: stay on this prompt */
+                    hist_reset(&s);
+                    redraw(&s);
+                    break;
+                }
                 s.cursor = s.buf.len;
                 redraw_ex(&s, true);
                 wrs("\x1b[90m^C\x1b[0m\r\n");

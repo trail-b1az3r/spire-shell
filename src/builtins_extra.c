@@ -1226,7 +1226,12 @@ static int b_kill(int argc, char **argv) {
             target = -j->pgid;
             if (sig == SIGCONT || sig == SIGKILL || sig == SIGTERM) j->state = (sig == SIGCONT) ? JOB_RUNNING : j->state;
         } else target = (pid_t)atoi(argv[i]);
-        if (kill(target, sig) != 0) { sh_err("kill: (%s) - %s\n", argv[i], strerror(errno)); status = 1; }
+        if (kill(target, sig) != 0) { sh_err("kill: (%s) - %s\n", argv[i], strerror(errno)); status = 1; continue; }
+        /* a stopped job can't act on TERM/HUP/INT until it's continued */
+        if (argv[i][0] == '%' && (sig == SIGTERM || sig == SIGHUP || sig == SIGINT || sig == SIGQUIT)) {
+            Job *j = job_from_spec(argv[i]);
+            if (j && j->state == JOB_STOPPED) { kill(target, SIGCONT); j->state = JOB_RUNNING; }
+        }
     }
     return status;
 }

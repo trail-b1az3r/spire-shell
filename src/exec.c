@@ -190,6 +190,19 @@ static void reset_child_signals(void) {
     }
 }
 
+/* A foreground child takes the terminal for its own process group itself,
+ * right after creating it. The parent does the same after fork(), but
+ * without this the child can reach a terminal read (or a termios change)
+ * first, be stopped with SIGTTIN/SIGTTOU, and leave a stopped copy behind
+ * holding its locks: the classic job-control race that bash and fish also
+ * close this way. */
+static void take_terminal(void) {
+    if (!g_shell_is_interactive) return;
+    signal(SIGTTOU, SIG_IGN);
+    tcsetpgrp(STDIN_FILENO, getpgrp());
+    signal(SIGTTOU, SIG_DFL);
+}
+
 /* ---------- process substitution ---------- */
 
 static int g_procsub_fds[64];
@@ -593,6 +606,7 @@ static int run_in_current_process(strvec_t *argv, bool allow_exec_replace) {
     if (pid == 0) {
         reset_child_signals();
         setpgid(0, 0);
+        take_terminal();
         execvp(name, cargv);
         int err = errno;
         report_exec_failure(name, err);
@@ -718,6 +732,7 @@ int exec_run_argv_nofunc(int argc, char **argv) {
     if (pid == 0) {
         reset_child_signals();
         setpgid(0, 0);
+        take_terminal();
         char **c = sv_to_argv(&v);
         execvp(c[0], c);
         int err = errno;
@@ -806,6 +821,7 @@ static int exec_simple_command(Node *n) {
         } else if (pid == 0) {
             reset_child_signals();
             setpgid(0, 0);
+            take_terminal();
             if (apply_redirects(n->redirects) != 0) flush_exit(1);
             int st = run_in_current_process(&argv, true);
             flush_exit(st);
@@ -872,6 +888,7 @@ static int exec_pipeline(Node *n) {
         if (pid == 0) {
             setpgid(0, pgid); /* first stage: pgid==0 -> becomes its own leader */
             reset_child_signals();
+            if (!lastpipe) take_terminal(); /* with lastpipe the shell keeps the terminal */
             g_shell_is_interactive = false; /* no job control inside a stage */
             if (i > 0) dup2(pipes[i - 1][0], STDIN_FILENO);
             if (i < k - 1) {
@@ -1130,6 +1147,7 @@ static int exec_subshell(Node *n) {
     if (pid == 0) {
         reset_child_signals();
         setpgid(0, 0);
+        take_terminal();
         g_shell_is_interactive = false;
         int st = exec_block(n->children[0]);
         exec_run_exit_trap();
