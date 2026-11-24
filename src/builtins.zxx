@@ -1467,6 +1467,11 @@ fn builtin_local(argv) {
 
 // Fish-style random integer, inclusive. Use the runtime clock as a seed source.
 fn builtin_random(argv) {
+    if len(argv) > 2 and argv[1] == "choice" {
+        // fish: random choice ITEM...
+        outl(argv[2 + random(0, len(argv) - 3)])
+        return 0
+    }
     var lo = 0
     var hi = 32767
     if len(argv) > 1 {
@@ -1494,9 +1499,9 @@ fn builtin_random(argv) {
         err("random: range is too large")
         return 2
     }
-    // Mix clock ticks with process ID to avoid a fixed value between rapid calls.
-    let seed = (os.time_ms() * 1103515245 + os.pid() * 12345 + 12345) % 2147483647
-    outl(str(lo + (seed % span)))
+    // the language's own generator: an int from lo to hi inclusive (the
+    // previous clock-based formula overflowed on every call)
+    outl(str(random(lo, hi)))
     return 0
 }
 
