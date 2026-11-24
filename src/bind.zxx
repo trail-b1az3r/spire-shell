@@ -226,6 +226,20 @@ fn next_key(st) {
     }
     loop {
         let k = os.read_key()
+        if k == "\e[200~" {
+            var pasted = ""
+            loop {
+                let chunk = os.read_key()
+                if chunk == "" {
+                    break
+                }
+                if chunk == "\e[201~" {
+                    break
+                }
+                pasted = pasted + chunk
+            }
+            return "\e[200~" + pasted + "\e[201~"
+        }
         if k == "" or not dispatch_binding(st, k) {
             return k
         }

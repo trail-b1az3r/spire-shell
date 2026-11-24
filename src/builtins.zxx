@@ -3,6 +3,12 @@
 var ABBRS = {}
 var HISTORY = []
 var LS_OPTS = null       // the color/indicator flags this system's ls accepts
+var PSUB_FILES = {}
+
+fn builtin_enable_transience(argv) {
+    // Fish compatibility: transient prompts are unsupported; succeed quietly.
+    return 0
+}
 
 fn builtin_cd(argv) {
     var target = len(argv) > 1 ? argv[1] : os.home()
@@ -292,7 +298,34 @@ fn builtin_source(argv) {
     var_set("argv", argv[2:])
     let st = run_source(text, argv[1])
     var_set("argv", saved ?? [])
+    cleanup_psub(argv[1])
     return st
+}
+
+fn builtin_psub(argv) {
+    // Write piped stdin to a temporary fish script and print its path.
+    let content = stdin_text() ?? ""
+    let path = "/tmp/spire-psub-" + str(os.pid()) + "-" + str(os.time_ms()) + ".fish"
+    if not os.write_file(path, content) {
+        err("psub: unable to write temporary script")
+        return 1
+    }
+    PSUB_FILES[path] = true
+    outl(path)
+    return 0
+}
+
+fn cleanup_psub(path) {
+    if path in PSUB_FILES {
+        os.run([["rm", "-f", path]], {capture: true, stderr: "/dev/null"})
+        remove(PSUB_FILES, path)
+    }
+}
+
+fn cleanup_all_psub() {
+    for path in keys(PSUB_FILES) {
+        cleanup_psub(path)
+    }
 }
 
 fn builtin_read(argv) {
@@ -573,7 +606,8 @@ fn builtin_string(argv) {
         return 2
     }
     let sub = argv[1]
-    var args = [a for a in argv[2:] if a != "--"]
+    var raw_args = argv[2:]
+    var args = [a for a in raw_args if a != "--"]
     var flags = [a for a in args if a.starts_with("-") and len(a) > 1]
     args = [a for a in args if not (a.starts_with("-") and len(a) > 1)]
     var piped = null
@@ -584,6 +618,69 @@ fn builtin_string(argv) {
         args = [l for l in piped.split("\n") if l != ""]
     }
     let quiet = "-q" in flags or "--quiet" in flags
+    if sub == "sub" {
+        // fish-compatible substring: positions are 1-based, end is inclusive.
+        var start = 1
+        var end_pos = null
+        var length = null
+        var values = []
+        var i = 0
+        while i < len(raw_args) {
+            let a = raw_args[i]
+            if (a == "-s" or a == "--start") and i + 1 < len(raw_args) {
+                start = int(raw_args[i + 1])
+                i += 2
+                continue
+            }
+            if (a == "-e" or a == "--end") and i + 1 < len(raw_args) {
+                end_pos = int(raw_args[i + 1])
+                i += 2
+                continue
+            }
+            if (a == "-l" or a == "--length") and i + 1 < len(raw_args) {
+                length = int(raw_args[i + 1])
+                i += 2
+                continue
+            }
+            if a == "-q" or a == "--quiet" {
+                i += 1
+                continue
+            }
+            if a == "--" {
+                i += 1
+                while i < len(raw_args) {
+                    values.push(raw_args[i])
+                    i += 1
+                }
+                break
+            }
+            values.push(a)
+            i += 1
+        }
+        if len(values) == 0 {
+            let input = stdin_text()
+            if input != null {
+                values = [l for l in input.split("\n") if l != ""]
+            }
+        }
+        for value in values {
+            let n = len(value)
+            var first = start > 0 ? start - 1 : max(0, n + start)
+            first = min(first, n)
+            var last = n
+            if end_pos != null {
+                last = end_pos > 0 ? end_pos : max(0, n + end_pos + 1)
+                last = min(max(last, 0), n)
+            } elif length != null {
+                last = min(n, max(first, first + max(0, length)))
+            }
+            if end_pos != null and length != null {
+                last = min(last, first + max(0, length))
+            }
+            outl(value[first:max(first, last)])
+        }
+        return len(values) > 0 ? 0 : 1
+    }
     if sub == "upper" or sub == "lower" {
         for a in args {
             outl(sub == "upper" ? a.upper() : a.lower())
@@ -1066,6 +1163,7 @@ fn run_pending_traps() {
 
 fn shell_exit(code) {
     run_trap("EXIT")
+    cleanup_all_psub()
     raw_mode(false)
     os.exit(code)
 }
@@ -1366,6 +1464,42 @@ fn builtin_local(argv) {
     return 0
 }
 
+
+// Fish-style random integer, inclusive. Use the runtime clock as a seed source.
+fn builtin_random(argv) {
+    var lo = 0
+    var hi = 32767
+    if len(argv) > 1 {
+        try {
+            lo = int(argv[1])
+        } catch e {
+            err("random: invalid minimum: ${argv[1]}")
+            return 2
+        }
+    }
+    if len(argv) > 2 {
+        try {
+            hi = int(argv[2])
+        } catch e {
+            err("random: invalid maximum: ${argv[2]}")
+            return 2
+        }
+    }
+    if hi < lo {
+        err("random: maximum must be greater than or equal to minimum")
+        return 2
+    }
+    let span = hi - lo + 1
+    if span <= 0 {
+        err("random: range is too large")
+        return 2
+    }
+    // Mix clock ticks with process ID to avoid a fixed value between rapid calls.
+    let seed = (os.time_ms() * 1103515245 + os.pid() * 12345 + 12345) % 2147483647
+    outl(str(lo + (seed % span)))
+    return 0
+}
+
 fn builtin_true(argv) {
     return 0
 }
@@ -1380,6 +1514,8 @@ fn builtin_pwd(argv) {
 }
 
 const BUILTINS = {
+    "psub": builtin_psub,
+    "enable_transience": builtin_enable_transience,
     "cd": builtin_cd,
     "echo": builtin_echo,
     "set": builtin_set,
@@ -1412,6 +1548,7 @@ const BUILTINS = {
     "fish_vcs_prompt": builtin_fish_vcs_prompt,
     "fish_git_prompt": builtin_fish_vcs_prompt,
     "help": builtin_help,
+    "random": builtin_random,
     "true": builtin_true,
     "false": builtin_false,
     "pwd": builtin_pwd,

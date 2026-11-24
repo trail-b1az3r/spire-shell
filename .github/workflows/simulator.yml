@@ -1,0 +1,89 @@
+name: Spire simulator
+
+on:
+  push:
+    branches:
+      - 'z#nd'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  simulator:
+    name: Runtime simulator (commands + scripts)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Spire
+        uses: actions/checkout@v4
+        with:
+          ref: z#nd
+
+      - name: Checkout Whetstone
+        uses: actions/checkout@v4
+        with:
+          repository: trail-b1az3r/z-nd
+          ref: claude/spire-in-zsharpend
+          path: z-nd
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Whetstone
+        run: cargo build --release -p whetstone
+        working-directory: z-nd
+
+      - name: Set runtime path
+        run: echo "WHETSTONE=$GITHUB_WORKSPACE/z-nd/target/release/whetstone" >> "$GITHUB_ENV"
+
+      - name: Validate and compile Spire
+        run: |
+          "$WHETSTONE" check .
+          sh ./compile-spire.sh
+          test -s build/spire.wsb
+
+      - name: Run regression suite
+        run: sh ./tests/run.sh
+
+      - name: Simulate user command sessions
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_case() {
+            name="$1"
+            command="$2"
+            expected="$3"
+            actual="$(sh ./spire -c "$command" 2>&1)" || {
+              echo "::error::Simulation failed: $name (command exited nonzero)"
+              printf 'Output: %s\n' "$actual"
+              exit 1
+            }
+            if [[ "$actual" != "$expected" ]]; then
+              echo "::error::Simulation failed: $name"
+              printf 'Expected: %s\nActual:   %s\n' "$expected" "$actual"
+              exit 1
+            fi
+            echo "PASS: $name"
+          }
+
+          # The regressions reported from a real terminal session.
+          run_case "test numeric equality" 'test 4 -eq 4 && echo test-ok' 'test-ok'
+          run_case "string substring start+length" 'string sub -s 2 -l 3 abcdef' 'bcd'
+          run_case "string substring end" 'string sub -s 2 -e 4 abcdef' 'bcd'
+          run_case "string substring negative start" 'string sub -s -3 abcdef' 'def'
+
+          # random is inherently variable: validate numeric output and bounds.
+          value="$(sh ./spire -c 'random 1 4' 2>&1)" || {
+            echo "::error::Simulation failed: random builtin exited nonzero"
+            printf 'Output: %s\n' "$value"
+            exit 1
+          }
+          if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value < 1 || value > 4 )); then
+            echo "::error::Simulation failed: random output is not within 1..4"
+            printf 'Output: %s\n' "$value"
+            exit 1
+          fi
+          echo "PASS: random range"
+
+          run_case "script execution" 'echo simulator-script-ok' 'simulator-script-ok'

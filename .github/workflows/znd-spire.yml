@@ -1,0 +1,44 @@
+name: Z# Spire checks
+
+on:
+  push:
+    branches:
+      - 'z#nd'
+      - 'fix/**'
+  pull_request:
+    branches:
+      - 'z#nd'
+
+jobs:
+  compile-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Spire
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Checkout Zsharpend/Whetstone
+        uses: actions/checkout@v4
+        with:
+          repository: trail-b1az3r/z-nd
+          ref: claude/spire-in-zsharpend
+          path: z-nd
+      - name: Build Whetstone
+        run: cargo build --release -p whetstone
+        working-directory: z-nd
+      - name: Verify shell scripts
+        run: |
+          sh -n spire compile-spire.sh tests/run.sh tests/run-compat.sh tools/test-launcher-symlink.sh
+          sh tools/test-launcher-symlink.sh
+      - name: Check Z# Spire source
+        env:
+          WHETSTONE: ${{ github.workspace }}/z-nd/target/release/whetstone
+        run: $WHETSTONE check .
+      - name: Build Spire bundle
+        env:
+          WHETSTONE: ${{ github.workspace }}/z-nd/target/release/whetstone
+        run: sh ./compile-spire.sh
+      - name: Run regression suite
+        env:
+          WHETSTONE: ${{ github.workspace }}/z-nd/target/release/whetstone
+        run: sh ./tests/run.sh
